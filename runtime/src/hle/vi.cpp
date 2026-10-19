@@ -9,6 +9,7 @@
 #include "platform/host_platform.h"
 #include "runtime_log.h"
 #include "audio_backend.h"
+#include "eggy/eggy.h"
 
 #include <dolphin/vi.h>
 
@@ -152,9 +153,18 @@ constexpr uint32_t kViRetraceQueueAddr      = 0x80386bc0; // Thread queue for VI
 // EGG::BaseSystem::sSystem pointer - must be non-null before post-retrace callback is valid
 constexpr uint32_t kEggSSystemAddr = 0x80386F60;
 
+// [eggy] Eggy's lockstep time sync runs the retrace clock a little fast or slow
+// (VI_HLE_EggySetPace below; 1 everywhere else).
+std::atomic<double> g_eggyPace{1.0};
+
 std::chrono::microseconds IntervalForFormat(uint32_t tvFormat) {
     // NTSC-ish defaults to 60 Hz; PAL uses 50 Hz.
-    return tvFormat == 1 ? 20000us : 16666us;
+    const std::chrono::microseconds base = tvFormat == 1 ? 20000us : 16666us;
+    const double pace = g_eggyPace.load(std::memory_order_relaxed);
+    if (pace == 1.0) {
+        return base;
+    }
+    return std::chrono::microseconds(static_cast<int64_t>(static_cast<double>(base.count()) / pace + 0.5));
 }
 
 // Shared busy-wait budget for deadline-precise sleeps (matches Aurora's
@@ -994,3 +1004,25 @@ extern "C" void VIWaitForRetrace_HLE_801b99ec(CpuContext* ctx)
     ViSetR3(cpu, 0);
 }
 PPC_NATIVE_OVERRIDE_VOID(801B99EC, VIWaitForRetrace_HLE_801b99ec, (CpuContext* ctx), (ctx));
+
+// [eggy] runtime/src/eggy/eggy.cpp parks the guest while idle or while a loaded race waits for
+// go, exactly as ParkWhilePageHidden does for a hidden page: the retrace grid moves forward by the
+// parked time.
+void VI_HLE_EggyNoteHostPark(std::chrono::nanoseconds parked) {
+    if (parked.count() <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_viMutex);
+    g_vi.lastRetrace += std::chrono::duration_cast<Clock::duration>(parked);
+}
+
+// [eggy] Eggy's pace(factor) mailbox: the next retraces come `factor` times as often.
+void VI_HLE_EggySetPace(double factor) {
+    if (!(factor >= 0.5 && factor <= 2.0)) {
+        factor = 1.0;
+    }
+    std::lock_guard<std::mutex> lock(g_viMutex);
+    g_eggyPace.store(factor, std::memory_order_relaxed);
+    g_vi.retraceInterval = IntervalForFormat(g_vi.tvFormat);
+    g_vi.pendingRetraceInterval = IntervalForFormat(g_vi.pendingTvFormat);
+}

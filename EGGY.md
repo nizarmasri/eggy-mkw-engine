@@ -15,15 +15,20 @@ repository from a pinned commit of this one.
 |---|---|---|
 | `web/js/library_mkw_dvd.js` | `Module.mkwDiscSource`: when the page supplies `{manifest(mount), read(mount, relPath, offset, length)}`, the disc manifest and every read come from it instead of HTTP. | Eggy serves the disc as content-addressed 1 MiB chunks cached on the phone chunk by chunk, so a dropped connection or a closed page resumes where it stopped. |
 | `web/tests/web_disc_node_host.mjs`, `web/tests/run_web_disc_test.mjs` | A third Node run of the disc test through `mkwDiscSource`. | Proves the supplied source behaves exactly like the HTTP path (missing files, truncation, odd names). |
+| `runtime/src/hle/input/pad.cpp` | `PAD__Read_HLE` calls `Eggy::OverridePads` after the bindings; in Eggy mode the touch overlay is not applied. | Eggy mode takes every port's pad from the page's race frames (neutral outside a race); a no-op on the stock page. |
+| `runtime/src/hle/vi.cpp` | `IntervalForFormat` divides by a pace factor (1 unless Eggy sets it); `VI_HLE_EggyNoteHostPark` and `VI_HLE_EggySetPace` at the end of the file. | Eggy parks the whole guest while idle or waiting for go (the retrace grid moves on like the hidden-page park), and its lockstep runs the clock 0.9-1.1x. |
+| `runtime/src/hle/gx/gx_egg.cpp` | The `AsyncDisplay::endRender` HLE returns at once when `Eggy::SkipEndRender()`. | Race frames Eggy does not show (`renderSkip`) skip the EFB copy with the draw, so the screen keeps the last shown frame. |
 
 ## Added
 
 - `.github/workflows/eggy.yml`: the web disc test on every push (Node, JSPI, no game data).
-- `web/js/library_eggy.js`, `runtime/include/eggy/eggy.h`, `web/site/eggy.html`,
-  `web/site/eggy/eggy-engine.js`, `web/site/eggy/eggy-test.js`: Eggy's host API (work in
-  progress, see below). The library is inert until C++ references its imports.
+- `runtime/src/eggy/eggy.cpp`, `runtime/include/eggy/eggy.h`, `web/js/library_eggy.js`,
+  `web/site/eggy.html`, `web/site/eggy/eggy-engine.js`, `web/site/eggy/eggy-test.js`: Eggy's
+  host API (below). Hooks on 0x80009984, 0x80009988, 0x805302C4 and 0x8051AF84 are
+  `REGISTER_NATIVE_FUNCTION_AS` natives that call the translated bodies; without `Module.eggy`
+  they fall straight through.
 
-## Eggy host API: work in progress (2026-10-20)
+## Eggy host API (2026-10-20)
 
 Goal: `Module.eggy` boots to idle, loads a race from a config v1 (Eggy's
 `games/mkw/kit/config.ts`), parks on the race's first frame until `go`, takes
@@ -31,12 +36,14 @@ the four pads of each race frame from JS, snapshots kart state/HUD, reports the
 result. JS never calls guest code: mailboxes and snapshots live in one shared
 block (layout in `web/js/library_eggy.js` `Eggy.W`; the C++ side must match).
 
-Written so far (not yet built): the JS library (mailboxes, suspending
-`eggy_wait` / `eggy_pads`, callbacks), the `EngineLike` wrapper
-(`eggy-engine.js`), the test page (`eggy.html?course=..&humans=..&myPort=..`,
-no clicks, holds A, render-skips all but every 20th frame so the 1 fps smoke
-gets through the 240-frame countdown). Missing: `runtime/src/eggy/eggy.cpp`
-and the one call in `hle/input/pad.cpp` (`Eggy::OverridePads`).
+Pieces: the JS library (mailboxes, suspending `eggy_wait` / `eggy_pads`,
+callbacks), `runtime/src/eggy/eggy.cpp` (hooks, state machine, snapshots,
+hash, report), the `EngineLike` wrapper (`eggy-engine.js`), and the test page
+(`eggy.html?course=..&humans=..&myPort=..`, no clicks, holds A, render-skips
+all but every 20th frame so the slow CI smoke gets through the 240-frame
+countdown). Note: 0x8020FF9C (`AsyncDisplay::endRender`) is already a
+`PPC_NATIVE_OVERRIDE` in `hle/gx/gx_egg.cpp`, so render skip asks
+`Eggy::SkipEndRender()` there instead of registering a second native.
 
 ### How to hook guest code without losing it
 
@@ -121,15 +128,7 @@ prebuilt fingerprint.
 - Items: Item manager 0x809C3618 +0x14 players (0x248 each), inventory id
   +0x8C, count +0x90.
 
-### Next step
+### Status
 
-Write `runtime/src/eggy/eggy.cpp`: hooks at 0x80009984 (pre-calc: lazy
-`eggy_enabled`/`eggy_attach`, state machine idle -> load -> parked -> racing,
-`eggy_pads` before calc; post-calc: snapshots, hash, `eggy_frame_done`,
-report on stage >= 3 or `finishAll`), 0x805302C4 (bind holders and write
-menuScenario before, hud = 1 / hudPlayerIds[0] = myPort's slot / other
-humans' localPlayerNum = -1 / seeds after), 0x8051AF84, 0x80009988 and
-0x8020FF9C (render skip); `Eggy::OverridePads` in `pad.cpp`; a small
-`VI_HLE_NoteHostPark` / pace setter in `vi.cpp` so long parks shift the
-retrace grid. Then build + smoke `/eggy.html` (step 1-3), then
-`/eggy.html?humans=2&myPort=1` (step 4).
+Built and smoke-tested through the data repo's `build.yml` / `smoke.yml`; run
+ids and findings are recorded in the commits that follow.

@@ -1,4 +1,5 @@
 #include "hle_stubs.h"
+#include "eggy/eggy.h"
 #include "memory.h"
 #include "hle/controller_status_contract.h"
 #include "input_bindings.h"
@@ -122,13 +123,17 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
 
     FillTriggersHeldByButtons(statuses);
     InputBindings::Apply(statuses);
+    // [eggy] In Eggy mode every port's pad comes from the page's race frames (eggy/eggy.cpp).
+    const bool eggyPads = Eggy::OverridePads(statuses, PAD_CHANMAX);
 #if defined(__EMSCRIPTEN__)
     // [web] Phone / tablet on-screen controls join player 1 (not while the settings bar is open).
-    if (!InputBindings::InputBlocked()) {
+    if (!eggyPads && !InputBindings::InputBlocked()) {
         WebInput::ApplyTouch(statuses, PAD_CHANMAX);
     }
     // [web] The page's input debug view shows exactly these statuses.
     WebInput::PublishPadStatus(statuses, PAD_CHANMAX, rumbleMask);
+#else
+    (void)eggyPads;
 #endif
 
     try {

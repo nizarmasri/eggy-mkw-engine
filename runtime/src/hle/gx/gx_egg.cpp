@@ -1,5 +1,6 @@
 // gx_egg.cpp - EGG Library Helper Stubs
 #include "gx_internal.h"
+#include "eggy/eggy.h"
 
 // Vertex helper declarations not used by the direct-call catalog.
 extern "C" void GX__SetArray_8016e32c(uint32_t a, uint32_t ba, uint32_t str);
@@ -115,6 +116,10 @@ PPC_NATIVE_OVERRIDE_VOID(8022e2bc, EGG__LightTexture__SetupTevFinish_HLE_8022e2b
 // ============================================================================
 
 extern "C" void EGG__AsyncDisplay__endRender_HLE_8020ff9c(CpuContext* ctx) {
+    // [eggy] Nothing was drawn on a race frame Eggy skips (renderSkip): keep the last frame.
+    if (Eggy::SkipEndRender()) {
+        return;
+    }
     uint32_t p = ctx->gpr[3]; ctx->gpr[3] = p; ctx->lr = 0x8020FF9C;
     InvokeIndirectCpu(0x80219FB4u, ctx);
     InvokeIndirectCpu(0x8016ED50u, ctx);

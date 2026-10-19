@@ -41,7 +41,7 @@ addToLibrary({
     CONFIG_WORDS: 120,
     base: 0,
     waiter: null,
-    reportRead: 0,
+    padCancel: null,
 
     install() {
       const api = Module['eggy'];
@@ -108,6 +108,8 @@ addToLibrary({
     bump(w) {
       if (!Eggy.base) return;
       HEAP32[(Eggy.base >> 2) + w] = (HEAP32[(Eggy.base >> 2) + w] + 1) | 0;
+      // Abort and load also end a pad wait (the race they belong to is over).
+      if (w === Eggy.W.ABORT_SEQ || w === Eggy.W.LOAD_SEQ) Eggy.padCancel?.();
       Eggy.wake();
     },
     // Resumes the engine if it is parked in eggy_wait (idle or parked on a race's first frame).
@@ -123,6 +125,9 @@ addToLibrary({
       const at = (Eggy.base >> 2) + Eggy.W.CONFIG;
       HEAP32.fill(0, at, at + Eggy.CONFIG_WORDS);
       HEAP32.set(words.subarray(0, Eggy.CONFIG_WORDS), at);
+      // A new race: nobody is away and nothing is scheduled to finish it yet.
+      for (let p = 0; p < 4; p++) HEAP32[(Eggy.base >> 2) + Eggy.W.AWAY + p] = -1;
+      HEAP32[(Eggy.base >> 2) + Eggy.W.FINISH_ALL] = -1;
       Eggy.bump(Eggy.W.LOAD_SEQ);
     },
 
@@ -240,8 +245,9 @@ addToLibrary({
   }),
 
   // The four pads of race frame `frame` into `dest` (16 bytes). Resolves 1 when the page's pad
-  // source supplied them, 0 when there is none (the engine then uses neutral pads). The engine's
-  // stack stays parked while the source's promise is pending: that is the lockstep's wait.
+  // source supplied them, 0 when there is none (the engine then uses neutral pads), -1 when abort()
+  // or load() ended the wait. The engine's stack stays parked while the source's promise is
+  // pending: that is the lockstep's wait.
   eggy_pads__deps: ['$Eggy'],
   eggy_pads__async: true,
   eggy_pads: (frame, dest) => {
@@ -256,8 +262,19 @@ addToLibrary({
       return Promise.resolve(0);
     }
     if (pads && typeof pads.then == 'function') {
-      return pads.then((value) => { Eggy.writePads(value, dest); return 1; },
-                       (e) => { err(`[eggy] padSource(${frame}) rejected: ${e && e.stack || e}`); return 0; });
+      return new Promise((resolve) => {
+        let done = false;
+        const finish = (value) => {
+          if (done) return;
+          done = true;
+          if (Eggy.padCancel === cancel) Eggy.padCancel = null;
+          resolve(value);
+        };
+        const cancel = () => finish(-1);
+        Eggy.padCancel = cancel;
+        pads.then((value) => { if (!done) { Eggy.writePads(value, dest); finish(1); } },
+                  (e) => { err(`[eggy] padSource(${frame}) rejected: ${e && e.stack || e}`); finish(0); });
+      });
     }
     Eggy.writePads(pads, dest);
     return Promise.resolve(1);
