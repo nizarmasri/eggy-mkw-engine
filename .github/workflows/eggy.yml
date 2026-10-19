@@ -1,0 +1,39 @@
+# Eggy's checks on this fork: the web disc layer under Node (JSPI), including the
+# page-supplied disc source Eggy reads its chunk cache through. No game data:
+# the test builds a fake disc tree. The full game build happens in Eggy's
+# private data repository, never here.
+name: eggy
+on:
+  push:
+    branches: [web-port]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  web-disc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Emscripten, cached
+        uses: actions/cache@v4
+        with:
+          path: emsdk
+          key: emsdk-6.0.12-${{ runner.os }}
+      - name: Emscripten
+        run: |
+          if [ ! -x emsdk/emsdk ]; then
+            git clone --depth 1 https://github.com/emscripten-core/emsdk emsdk
+            ./emsdk/emsdk install 6.0.12
+            rm -rf emsdk/zips emsdk/downloads
+          fi
+          ./emsdk/emsdk activate 6.0.12 > /dev/null
+          echo "EMSDK=$PWD/emsdk" >> "$GITHUB_ENV"
+      - name: The JS libraries parse
+        run: for f in web/js/*.js web/tests/*.mjs; do node --check "$f"; done
+      - name: Web disc test (Node, JSPI)
+        env:
+          MKW_JSPI_NODE: node
+        run: web/tests/run_web_disc_test.sh "$RUNNER_TEMP/web-disc" --no-browser

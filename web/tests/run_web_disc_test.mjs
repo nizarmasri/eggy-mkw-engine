@@ -268,6 +268,24 @@ if (runNode) {
     failed = true;
   }
 
+  // Eggy: the same test with the page supplying the disc (Module.mkwDiscSource), not the module.
+  const supplied = await runModule('disc via mkwDiscSource', 'web_disc_test.mjs', {
+    arguments: [...testArgs, '--persist=none'],
+    eggySource: { manifestUrl: `${origin}/disc-manifest.json`, baseUrl: `${origin}/disc/` },
+    mkwDiscPrefetchManifest: false,
+  });
+  const suppliedMissing = supplied.requests.filter((r) => r.status === 404).map((r) => r.path);
+  console.log(`node disc via mkwDiscSource: exit ${supplied.code}; ${supplied.requests.length} HTTP requests; ` +
+              `404s: ${suppliedMissing.join(', ')}`);
+  if (!suppliedMissing.includes('/disc/files/gone.bin')) {
+    console.error('FAIL: mkwDiscSource: expected the missing file to be asked for and reported missing');
+    failed = true;
+  }
+  if (!supplied.requests.some((r) => r.path === '/disc/files/Race/Kart/kart Mario+Peach #1 %20.szs' && r.status === 206)) {
+    console.error('FAIL: mkwDiscSource: file name with special characters was not read correctly');
+    failed = true;
+  }
+
   // Node has no page URL, so the mod manifest URL is given absolutely; modRoot still names the
   // mount (/mods/RetroRewind6).
   const riivo = await runModule('riivolution', 'web_riivolution_test.mjs', {

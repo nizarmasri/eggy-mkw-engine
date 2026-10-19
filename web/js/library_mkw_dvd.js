@@ -31,6 +31,10 @@
 //   mkwModManifestUrl   mod manifest URL (default modRoot + '-manifest.json')
 //   mkwModBaseUrl       mod tree URL (default: that manifest's "root", i.e. modRoot + '/')
 //   mkwDiscRetries      attempts per request for network errors / 5xx (default 4)
+//   mkwDiscSource       (Eggy) {manifest(mount) -> Promise<manifest JSON>, read(mount, relPath,
+//                       offset, length) -> Promise<Uint8Array | null>}: the page supplies the
+//                       manifest and every read itself (from its own chunk cache) instead of
+//                       fetching them over HTTP. null from read means no such file.
 //   mkwDiscPrefetchManifest  false: do not start fetching manifests at module load
 //   mkwPersistence      false keeps saves in memory only (default: on when IndexedDB exists)
 //   mkwPersistentDir    mount point of the persistent store (default '/home/web_user')
@@ -116,20 +120,28 @@ addToLibrary({
     async fetchManifest(mount) {
       const state = MkwDvd.mounts[mount];
       try {
-        const source = MkwDvd.sourceFor(mount);
-        const manifestUrl = MkwDvd.resolveUrl(source.manifestUrl, MkwDvd.pageUrl());
-        const response = await MkwDvd.fetchWithRetry(manifestUrl, {});
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status} ${response.statusText} for ${manifestUrl}`);
+        const supplied = Module['mkwDiscSource'];
+        const source = supplied ? null : MkwDvd.sourceFor(mount);
+        const manifestUrl = supplied ? `mkwDiscSource:${mount}` : MkwDvd.resolveUrl(source.manifestUrl, MkwDvd.pageUrl());
+        let manifest;
+        if (supplied) {
+          manifest = await supplied['manifest'](mount);
+        } else {
+          const response = await MkwDvd.fetchWithRetry(manifestUrl, {});
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status} ${response.statusText} for ${manifestUrl}`);
+          }
+          manifest = await response.json();
         }
-        const manifest = await response.json();
         // Bracket access throughout: JSON field names must survive --closure.
         const files = manifest?.['files'];
         if (manifest?.['format'] !== 'wiicompiled-disc-manifest' || manifest['version'] !== 1 ||
             typeof files !== 'object' || files === null) {
           throw new Error(`${manifestUrl} is not a version 1 WiiCompiled disc manifest`);
         }
-        let base = source.baseUrl
+        // With a supplied source the base is only a label: reads never become URLs.
+        let base = supplied ? manifestUrl
+          : source.baseUrl
           ? MkwDvd.resolveUrl(source.baseUrl, MkwDvd.pageUrl())
           : MkwDvd.resolveUrl(manifest['root'] ?? source.defaultRoot, manifestUrl);
         if (!base.endsWith('/')) base += '/';
@@ -181,6 +193,21 @@ addToLibrary({
 
     async read(mount, relPath, offset, length, dest) {
       if (!MkwDvd.mounts[mount]?.baseUrl) return -2; // manifest never loaded
+      const supplied = Module['mkwDiscSource'];
+      if (supplied) {
+        let bytes;
+        try {
+          bytes = await supplied['read'](mount, relPath, offset, length);
+        } catch (e) {
+          err(`[dvd/eggy] ${relPath}@${offset}+${length}: ${e && e.message || e}`);
+          return -2;
+        }
+        if (bytes == null) return -1;
+        const count = Math.min(length, bytes.length);
+        // HEAPU8 is re-read after the await: memory may have grown meanwhile.
+        HEAPU8.set(bytes.subarray(0, count), dest);
+        return count;
+      }
       const url = MkwDvd.urlFor(mount, relPath);
       let response;
       try {

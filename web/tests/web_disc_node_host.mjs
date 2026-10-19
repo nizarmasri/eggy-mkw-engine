@@ -18,9 +18,30 @@ const print = (line) => {
   if (/^(PASS|FAIL) web (disc|riivolution) test|^FAIL: /.test(line)) finish(line);
 };
 
+// `eggySource: {manifestUrl, baseUrl}` (Eggy): the page supplies the disc itself through
+// Module.mkwDiscSource instead of the module fetching it. Here the source reads the same test
+// server over HTTP, so every assertion on the server's request log holds for both paths.
+const options = JSON.parse(optionsJson);
+const eggySource = options.eggySource;
+delete options.eggySource;
+if (eggySource) {
+  options.mkwDiscSource = {
+    manifest: async () => (await fetch(eggySource.manifestUrl)).json(),
+    read: async (mount, relPath, offset, length) => {
+      const url = eggySource.baseUrl + relPath.split('/').map(encodeURIComponent).join('/');
+      const response = await fetch(url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } });
+      if (response.status === 404 || response.status === 410) return null;
+      if (response.status === 416) return new Uint8Array(0);
+      if (response.status !== 206 && response.status !== 200) throw new Error(`HTTP ${response.status}`);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      return response.status === 206 ? bytes : bytes.subarray(offset, offset + length);
+    },
+  };
+}
+
 const createModule = (await import(pathToFileURL(modulePath).href)).default;
 createModule({
-  ...JSON.parse(optionsJson),
+  ...options,
   print,
   printErr: (line) => console.error(line),
   onAbort: (what) => finish(`FAIL: aborted: ${what}`),
