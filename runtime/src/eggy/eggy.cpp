@@ -464,7 +464,10 @@ void WriteSeeds(uint32_t scenario) {
 }
 
 // One screen whatever the number of humans: HUD and camera follow this phone's player only. The
-// others stay local players (their pads drive their karts) without a screen of their own.
+// others stay local players (their pads drive their karts) without a screen of their own. This is
+// the shape Scenario::initRace (0x8052FB90) itself gives the VS intro (camera mode 5): screen
+// count (+5) 1 while every local player keeps a local number (player +5) and a hudPlayerIds
+// entry. Here this phone's player is local 0 (the one screen), the other humans 1.. in slot order.
 void PatchOneScreen(uint32_t rc) {
     const uint32_t race = rc + kRaceScenario;
     if (g_humans <= 1 && R8(race + 0xB64) == static_cast<uint8_t>(g_mySlot)) {
@@ -472,16 +475,19 @@ void PatchOneScreen(uint32_t rc) {
     }
     W8(race + 5, 1);
     W8(race + 7, 1);
+    for (int i = 0; i < 4; ++i) W8(race + 0xB64 + static_cast<uint32_t>(i), 0xFF);
     W8(race + 0xB64, static_cast<uint8_t>(g_mySlot));
-    W8(race + 0xB65, 0xFF);
-    W8(race + 0xB66, 0xFF);
-    W8(race + 0xB67, 0xFF);
-    // Local player numbers: this phone's player 0, the other humans 1.. in slot order.
     int next = 1;
     for (int k = 0; k < g_localCount; ++k) {
         const int slot = g_localSlot[k];
         const uint32_t p = race + kScenarioPlayers + static_cast<uint32_t>(slot) * kPlayerSize;
-        W8(p + 5, static_cast<uint8_t>(slot == g_mySlot ? 0 : next++));
+        if (slot == g_mySlot) {
+            W8(p + 5, 0);
+            continue;
+        }
+        W8(p + 5, static_cast<uint8_t>(next));
+        W8(race + 0xB64 + static_cast<uint32_t>(next), static_cast<uint8_t>(slot));
+        ++next;
     }
 }
 
@@ -500,6 +506,15 @@ void LogScenario(uint32_t rc, const char* what) {
                     slot, R32(p + 0x10), R32(p + 0xC), R32(p + 8), static_cast<int8_t>(R8(p + 5)),
                     static_cast<int8_t>(R8(p + 6)), static_cast<int32_t>(R32(p + 0xD0)), R32(p + 0xCC));
     }
+}
+
+// Every couple of seconds while booting or loading: where the game is, for the smoke logs.
+void LogProgress(const char* what) {
+    const uint32_t sm = SectionMgr();
+    std::printf("[eggy] %s: tick %d section 0x%02x fade %d initRace %d raceManager 0x%08x stage %d karts %d "
+                "pad calls %d\n",
+                what, g_shared[kTicks], CurrentSectionId(), sm ? static_cast<int>(R32(sm + 0x30)) : -1,
+                g_initRaceSeen ? 1 : 0, RaceManager(), Stage(), KartCount(), g_shared[kPadCalls]);
 }
 
 bool LoadReady() {
@@ -756,7 +771,10 @@ void PreCalc(CpuContext* ctx) {
             const uint32_t sm = SectionMgr();
             const bool settled = sm && Ptr(sm) && R32(sm + 0x30) == 0;
             g_bootSettled = settled ? g_bootSettled + 1 : 0;
-            if (g_bootSettled < 2) return;
+            if (g_bootSettled < 2) {
+                if ((g_shared[kTicks] % 120) == 1) LogProgress("booting");
+                return;
+            }
             std::printf("[eggy] booted to section 0x%02x\n", CurrentSectionId());
             SetState(kIdle);
             continue;
@@ -789,6 +807,7 @@ void PreCalc(CpuContext* ctx) {
                 SetState(kParked);
                 continue;
             }
+            if ((g_shared[kTicks] % 120) == 0) LogProgress("loading");
             if (ElapsedUs(g_loadStarted) > 600u * 1000u * 1000u) {
                 WriteDiag();
                 Fail(kErrLoadTimeout, "the race did not finish loading in 10 minutes");

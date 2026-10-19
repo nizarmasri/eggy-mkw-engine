@@ -130,5 +130,14 @@ prebuilt fingerprint.
 
 ### Status
 
-Built and smoke-tested through the data repo's `build.yml` / `smoke.yml`; run
-ids and findings are recorded in the commits that follow.
+- 9cd5ff9 compiles: data-repo build run 39340035137, build job green (translator
+  and emscripten clean). Its publish job was refused by GitHub billing, so there is
+  no `engine-9cd5ff9` release yet; `gh run rerun 39340035137 --failed` publishes it
+  without rebuilding once Actions runs again.
+- Not yet smoke-tested. First smoke: `/eggy.html` with `click=''` (steps 1-3), then
+  `/eggy.html?humans=2&myPort=1` (step 4). The console carries `[eggy]` lines for
+  every state change, the load, the race scenario after initRace and at park,
+  progress every 120 ticks while booting/loading, and every 120 race frames.
+- Step 4's one-screen patch copies the shape the game gives its own VS intro
+  (`Scenario::initRace` 0x8052FB90 with camera mode 5): screen count 1 while every
+  local player keeps a local number and a hudPlayerIds entry.
