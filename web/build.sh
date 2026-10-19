@@ -79,6 +79,12 @@ Environment:
                               MKW_DISC_EXTRACT_CMD='DolphinTool extract -i {IMAGE} -o {OUT} -p DATA'
                             (paths containing spaces are fine: replacement happens after splitting)
   PYTHON                    Python 3 interpreter (default: python3)
+  MKW_WEB_THREADS           jspi (default) or baton. baton builds WiiCompiledBaton.js/.wasm: no JSPI,
+                            every guest thread a pthread (for Safari 26 and other browsers without
+                            JSPI). It needs SharedArrayBuffer, so the site must be served
+                            cross-origin isolated (COOP: same-origin, COEP: require-corp). It
+                            compiles aurora and its libraries from source (no prebuilt) in its own
+                            CMake directory (<build-dir>/wasm-baton). See EGGY.md.
 USAGE
 }
 
@@ -108,6 +114,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$disc_image" ]] || { usage >&2; fail "a disc image path is required"; }
+# [Eggy] Threading of the browser build (EGGY.md, "iOS 26: the baton build").
+web_threads=${MKW_WEB_THREADS:-jspi}
+case "$web_threads" in
+    jspi) glue_suffix=""; product_threads="" ;;
+    baton) glue_suffix="Baton"; product_threads=',"threads":"baton"' ;;
+    *) fail "MKW_WEB_THREADS must be jspi or baton, not '$web_threads'" ;;
+esac
 [[ -e "$disc_image" ]] || fail "disc image or extracted tree does not exist: $disc_image"
 disc_is_tree=0
 [[ -d "$disc_image" ]] && disc_is_tree=1
@@ -483,6 +496,9 @@ translator "${shard_args[@]}"
 # (d) Emscripten configure + build
 # ---------------------------------------------------------------------------
 cmake_build=$build_dir/wasm
+# The baton build compiles everything with -pthread: its own CMake directory, so switching
+# MKW_WEB_THREADS never reuses objects of the other kind.
+if [[ "$web_threads" == baton ]]; then cmake_build=$build_dir/wasm-baton; fi
 if [[ -f "$cmake_build/CMakeCache.txt" ]]; then
     cache_home=$(grep '^CMAKE_HOME_DIRECTORY:INTERNAL=' "$cmake_build/CMakeCache.txt" | cut -d= -f2- || true)
     cache_tc=$(grep '^CMAKE_TOOLCHAIN_FILE:' "$cmake_build/CMakeCache.txt" | cut -d= -f2- || true)
@@ -498,7 +514,11 @@ fi
 # from-source build by itself if it does not match.
 prebuilt_args=()
 prebuilt_archive=$workspace/web/prebuilt/web-prebuilt.tar.xz
-if [[ -f "$prebuilt_archive" && -f "$prebuilt_archive.sha256" ]]; then
+if [[ "$web_threads" == baton ]]; then
+    # Built without -pthread, so it cannot link into the baton module.
+    info "MKW_WEB_THREADS=baton: compiling aurora and its libraries from source with -pthread"
+    prebuilt_args=(-DMKW_WEB_THREADS=baton -DCMAKE_C_FLAGS=-pthread -DCMAKE_CXX_FLAGS=-pthread -DSDL_PTHREADS=ON)
+elif [[ -f "$prebuilt_archive" && -f "$prebuilt_archive.sha256" ]]; then
     prebuilt_sha=$(awk '{print $1}' "$prebuilt_archive.sha256")
     prebuilt_dir=$build_dir/web-prebuilt
     if [[ "$(cat "$prebuilt_dir/.archive-sha256" 2>/dev/null)" != "$prebuilt_sha" ]]; then
@@ -538,7 +558,8 @@ rm -f "$out_dir/products.json"
 
 # Each target emits into the build dir or (via MKW_PLATFORM_WEB_DIST) straight into dist.
 for target in "${targets[@]}"; do
-    for name in "$target.js" "$target.wasm"; do
+    output=$target$glue_suffix # what CMake named the module (WiiCompiled, or WiiCompiledBaton)
+    for name in "$output.js" "$output.wasm"; do
         src=""
         for dir in "$cmake_build" "$cmake_build/web" "$out_dir"; do
             if [[ -f "$dir/$name" ]]; then src=$dir/$name; break; fi
@@ -548,7 +569,7 @@ for target in "${targets[@]}"; do
         info "$name ($(du -h "$out_dir/$name" | awk '{print $1}'))"
     done
     for suffix in "${WEB_EXTRA_SUFFIXES[@]}"; do
-        if [[ -f "$cmake_build/$target$suffix" ]]; then cp -f "$cmake_build/$target$suffix" "$out_dir/$target$suffix"; info "$target$suffix"; fi
+        if [[ -f "$cmake_build/$output$suffix" ]]; then cp -f "$cmake_build/$output$suffix" "$out_dir/$output$suffix"; info "$output$suffix"; fi
     done
 done
 
@@ -566,7 +587,8 @@ info "generating $DISC_MANIFEST_NAME"
 [[ -s "$out_dir/$DISC_MANIFEST_NAME" ]] || fail "$DISC_MANIFEST_NAME was not written"
 
 # products.json tells the page which products this site holds (more than one shows a choice screen).
-products_json='[{"id":"WiiCompiled","title":"Mario Kart Wii","glue":"WiiCompiled.js"}'
+# [Eggy] "threads":"baton" marks a module that runs without JSPI (web/site/main.js).
+products_json='[{"id":"WiiCompiled","title":"Mario Kart Wii","glue":"WiiCompiled'$glue_suffix'.js"'$product_threads'}'
 if ((build_retro)); then
     mod_dest=$out_dir/$MODS_DIR_NAME/$RETRO_MOD_DIR_NAME
     info "copying the Retro Rewind mod tree to $mod_dest"
@@ -576,12 +598,14 @@ if ((build_retro)); then
     info "generating $MODS_DIR_NAME/$RETRO_MOD_DIR_NAME-manifest.json"
     "$python_bin" "$manifest_tool" --tree "$mod_dest" "$out_dir/$MODS_DIR_NAME/$RETRO_MOD_DIR_NAME-manifest.json" \
         || fail "make_disc_manifest.py failed for the Retro Rewind mod tree"
-    products_json+=',{"id":"RetroRewind","title":"Retro Rewind","glue":"RetroRewind.js","modRoot":"'$MODS_DIR_NAME/$RETRO_MOD_DIR_NAME'"}'
+    products_json+=',{"id":"RetroRewind","title":"Retro Rewind","glue":"RetroRewind'$glue_suffix'.js"'$product_threads',"modRoot":"'$MODS_DIR_NAME/$RETRO_MOD_DIR_NAME'"}'
 else
     # A previous build of this dist dir may have had Retro Rewind; do not leave it half there.
     rm -rf "$out_dir/$MODS_DIR_NAME"
-    rm -f "$out_dir/$RETRO_TARGET".js "$out_dir/$RETRO_TARGET".wasm "$out_dir/$RETRO_TARGET".data "$out_dir/$RETRO_TARGET".wasm.map
-    rm -f "$out_dir/$RETRO_TARGET".????????.wasm "$out_dir/$RETRO_TARGET".????????.wasm.gz "$out_dir/$RETRO_TARGET".????????.wasm.br
+    for retro in "$RETRO_TARGET" "${RETRO_TARGET}Baton"; do
+        rm -f "$out_dir/$retro".js "$out_dir/$retro".wasm "$out_dir/$retro".data "$out_dir/$retro".wasm.map
+        rm -f "$out_dir/$retro".????????.wasm "$out_dir/$retro".????????.wasm.gz "$out_dir/$retro".????????.wasm.br
+    done
 fi
 products_json+=']'
 printf '%s\n' "$products_json" > "$out_dir/products.json"
@@ -606,5 +630,10 @@ cat <<EOF
     Products:    $(grep -o '"id":"[A-Za-z]*"' "$out_dir/products.json" | cut -d'"' -f4 | tr '\n' ' ')
     Host:        any static server with HTTP Range support (nginx, Caddy, ...), serving .wasm as application/wasm.
                  Other devices need HTTPS for WebGPU: add --https --lan to serve.py (docs/web-hosting.md).
-    Players need Chrome/Edge 137+ (WebGPU + JSPI).
+$(if [[ "$web_threads" == baton ]]; then
+    echo "    Threads:     baton (no JSPI): WebGPU + SharedArrayBuffer, so serve it cross-origin isolated"
+    echo "                 (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp)."
+else
+    echo "    Players need Chrome/Edge 137+ (WebGPU + JSPI)."
+fi)
 EOF

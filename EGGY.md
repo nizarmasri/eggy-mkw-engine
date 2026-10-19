@@ -18,6 +18,11 @@ repository from a pinned commit of this one.
 | `runtime/src/hle/input/pad.cpp` | `PAD__Read_HLE` calls `Eggy::OverridePads` after the bindings; in Eggy mode the touch overlay is not applied. | Eggy mode takes every port's pad from the page's race frames (neutral outside a race); a no-op on the stock page. |
 | `runtime/src/hle/vi.cpp` | `IntervalForFormat` divides by a pace factor (1 unless Eggy sets it); `VI_HLE_EggyNoteHostPark` and `VI_HLE_EggySetPace` at the end of the file. | Eggy parks the whole guest while idle or waiting for go (the retrace grid moves on like the hidden-page park), and its lockstep runs the clock 0.9-1.1x. |
 | `runtime/src/hle/gx/gx_egg.cpp` | The `AsyncDisplay::endRender` HLE returns at once when `Eggy::SkipEndRender()`. | Race frames Eggy does not show (`renderSkip`) skip the EFB copy with the draw, so the screen keeps the last shown frame. |
+| `runtime/src/host_context.cpp` | A third web backend under `__EMSCRIPTEN_PTHREADS__` (the baton: every context a pthread, one runs at a time, shared TLS), plus `WebHost`'s baton functions and the `mkw_baton_counters` diagnostics. The JSPI backend is untouched. | iOS 26 has no JSPI (below). |
+| `runtime/include/platform/web_host.h` | A baton branch (`__EMSCRIPTEN_PTHREADS__`): `Yield` is a no-op, sleeps block, page visibility is a futex word; `BatonCounter`. The JSPI branch is unchanged. | Same. |
+| `runtime/cmake/PublicProducts.cmake` | `MKW_WEB_THREADS` (`jspi` default, or `baton`): the baton branch links `<Target>Baton.js/.wasm` without `-sJSPI` (cmake/WebBaton.cmake); the post-build copy uses `$<TARGET_FILE_BASE_NAME>` (the same names for JSPI). | Same. |
+| `web/build.sh` | `MKW_WEB_THREADS=baton`: no prebuilt, `-pthread` everywhere and `SDL_PTHREADS=ON`, its own CMake directory `wasm-baton`, `WiiCompiledBaton.js` and `"threads":"baton"` in products.json. Default output unchanged. | Same. |
+| `web/site/main.js` | `?nojspi` deletes `WebAssembly.Suspending`/`promising` before anything loads; without JSPI a cross-origin isolated page runs a `"threads":"baton"` product (JSPI preferred when a product has both). | Same, and to prove a module needs no JSPI. |
 
 ## Added
 
@@ -27,6 +32,9 @@ repository from a pinned commit of this one.
   host API (below). Hooks on 0x80009984, 0x80009988, 0x805302C4 and 0x8051AF84 are
   `REGISTER_NATIVE_FUNCTION_AS` natives that call the translated bodies; without `Module.eggy`
   they fall straight through.
+- The baton build (below): `runtime/cmake/WebBaton.cmake`,
+  `runtime/src/platform/web/baton_main_thread.cpp`, `web/js/baton/library_mkw_baton.js`, the
+  test `web/tests/baton/` and `.github/workflows/ios26.yml` (runs it on every push to `ios26`).
 
 ## Eggy host API (2026-10-20)
 
@@ -132,3 +140,67 @@ prebuilt fingerprint.
 
 Built and smoke-tested through the data repo's `build.yml` / `smoke.yml`; run
 ids and findings are recorded in the commits that follow.
+
+## iOS 26: the baton build (2026-10-20)
+
+Safari 26 (the owner's iPhone 11) has WebGPU, workers and, on a cross-origin isolated page,
+SharedArrayBuffer, but no JSPI, and the default build parks every guest thread as a JSPI stack
+on the browser main thread. `MKW_WEB_THREADS=baton web/build.sh ...` builds
+`WiiCompiledBaton.js/.wasm`, which needs no JSPI. The default JSPI build is unchanged: every
+baton line is behind `__EMSCRIPTEN_PTHREADS__` or in files only the baton link uses.
+
+**Guest threads.** Every HostContext is a pthread (a Web Worker) and exactly one holds the
+baton: `Switch` stores 1 in the destination's futex word, wakes it and waits on its own.
+`main()` runs on a worker too (`-sPROXY_TO_PTHREAD`) and is the scheduler, so the browser main
+thread never blocks. Natively and under JSPI all contexts are fibers of one thread and share its
+`thread_local`s (current CpuContext, FP mirror, SEH target, errno, the C++ exception globals);
+here a context adopts the scheduler's TLS block (`__tls_base`) when it first runs, which keeps
+those semantics exactly: only the baton holder runs and the futex hand-off orders memory like a
+fiber switch. A context destroyed after it ran stays parked for good (unwinding a guest stack
+would run cleanups against live state); the log counts them.
+
+**Waits.** `WebHost::Yield` is a no-op (nothing to yield to), `SleepUntil` is a real sleep
+(Atomics.wait), the hidden-page park blocks on a word the page's `visibilitychange` keeps.
+Everything the JSPI build awaited blocks instead: an `__async` JS import marked
+`__proxy: 'sync'` runs on the main thread and the worker waits for its promise (Emscripten's
+PROXY_SYNC_ASYNC). That covers the disc (`mkw_dvd_*`, so `Module.mkwDiscSource` keeps working,
+on the main thread where the page put it), the save store, and every `eggy_*` import
+(`web/js/baton/library_mkw_baton.js` decorates them all, so library_eggy.js needs no change).
+
+**Rendering: WebGPU stays on the browser main thread.** A worker blocked in Atomics.wait never
+returns to its event loop, so it can never present a canvas frame, have Chrome flush its WebGPU
+wire, or settle `createRenderPipelineAsync`/`mapAsync`: rendering from the guest's worker is
+not possible, and a dedicated render worker would need OffscreenCanvas plumbing through SDL for
+nothing the main thread cannot do. So aurora is split, without editing it (the link `--wrap`s
+the symbols in `cmake/WebBaton.cmake`; a name that stops matching fails the link):
+`aurora_begin_frame`, `_end_frame`, `_update`, `_shutdown`, `_set_display_mode` run on the main
+thread whole (three synchronous round trips a frame; encode and submit happen where the JSPI
+build did them); `aurora_initialize` stays on the worker so it can wait for the adapter and the
+device, with only its SDL window steps on the main thread (SDL registers DOM listeners for the
+calling thread). The WebGPU instance is created without TimedWaitAny (it needs Asyncify or JSPI)
+and timed waits poll from the worker. The WebGPU calls a guest thread makes while it decodes the
+GX FIFO (texture, bind group and pipeline cache misses, the movie's texture uploads) are proxied
+one at a time: every emdawnwebgpu import is marked `__proxy: 'sync'`.
+
+**What is slower.** Each hand-off is a futex wake of another worker (about 27 us on the iPhone,
+measured by the coordinator; the log prints the measured wake latency) instead of a JSPI
+suspend/resume on one thread; each aurora frame call and each proxied JS call is a round trip to
+the main thread, and the guest waits while the main thread encodes the frame (as it did under
+JSPI, where everything was one thread). The build prints, every 3 s:
+`[ios26] baton: ... frames | hand-offs (n/frame, us to wake) | JS calls on the main thread
+(n/frame, us each) | aurora calls on the main thread (n/frame, ms each) | guest blocked on the
+main thread x% | live contexts`, and the main thread a heartbeat every 5 s.
+
+**Known limits.**
+- If `createRenderPipelineAsync` fails, aurora builds that pipeline synchronously in the
+  callback, on the main thread, while the guest may be creating another one
+  (`pipeline_cache.cpp`'s `g_webAsync*` statics); a failure is already an error case.
+- The baton module compiles aurora and its libraries from source (`-pthread`), so it never uses
+  `web/prebuilt/`.
+- Workers: 8 are started before `main()`; more start on demand, one per guest thread.
+
+**Testing.** `web/tests/baton/` builds aurora with `-pthread` and runs the pieces above in
+headless Chromium with JSPI deleted (cross-origin isolated, SwiftShader WebGPU): contexts on
+their own workers sharing TLS, a proxied promise blocking a worker, frames presented from a
+guest context in the colour the guest cleared to. In the data repo, `build.yml` with
+`variant=baton` builds the game and `smoke.yml` with `path=/?nojspi=1` boots it without JSPI.

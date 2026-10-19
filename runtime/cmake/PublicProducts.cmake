@@ -216,6 +216,11 @@ endif()
 # native build copies beside the executable are embedded at /app (RuntimePlatform::
 # ExecutableDirectory() on the web). The aurora sqlite pipeline cache is off in the browser and
 # networking is compiled out, so neither the initial pipeline cache nor cacert.pem ships.
+# [Eggy] MKW_WEB_THREADS=baton builds the pthread variant instead (WiiCompiledBaton.js + .wasm,
+# no JSPI; cmake/WebBaton.cmake). The default, jspi, is unchanged.
+set(MKW_WEB_THREADS "jspi" CACHE STRING
+    "Web threading: jspi (default; Chrome/Edge 137+) or baton (pthreads, no JSPI; see EGGY.md)")
+set_property(CACHE MKW_WEB_THREADS PROPERTY STRINGS jspi baton)
 function(mkw_configure_web_product target)
     set(web_dir "${MKW_RUNTIME_SOURCE_DIR}/../web")
     set(dsp_rom "${MKW_RUNTIME_SOURCE_DIR}/assets/dsp/dsp_coef.bin")
@@ -225,35 +230,57 @@ function(mkw_configure_web_product target)
     endif()
     file(GLOB js_libraries CONFIGURE_DEPENDS "${web_dir}/js/*.js")
     set_target_properties(${target} PROPERTIES SUFFIX ".js")
-    target_link_options(${target} PRIVATE
-        -sJSPI
-        "-sJSPI_EXPORTS=main,mkw_host_context_entry"
-        -sENVIRONMENT=web
-        -sALLOW_MEMORY_GROWTH=1
-        # The translated game's static data alone is ~24 MB (above the 16 MB default), and the
-        # guest MEM1/MEM2 stores (152 MiB) are allocated at startup anyway.
-        -sINITIAL_MEMORY=256MB
-        -sMAXIMUM_MEMORY=4GB
-        # The main stack hosts the scheduler; guest threads own their own shadow stacks.
-        -sSTACK_SIZE=8MB
-        -sEXPORTED_RUNTIME_METHODS=FS,ENV
-        # <target>.js.symbols maps wasm function indices to names, so a stack from a player's
-        # error report ("wasm-function[N]") can be symbolized without shipping a name section.
-        --emit-symbol-map
-        -lidbfs.js
-        "--embed-file=${dsp_rom}@/app/dsp_coef.bin"
-        "--embed-file=${bootstrap}@/app/wii_bootstrap")
+    if(MKW_WEB_THREADS STREQUAL "baton")
+        include("${MKW_RUNTIME_SOURCE_DIR}/cmake/WebBaton.cmake")
+        mkw_web_baton_check()
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME "${target}Baton")
+        # As below, minus JSPI and the 4 GB maximum (mkw_web_baton_link_options adds threads).
+        target_link_options(${target} PRIVATE
+            -sENVIRONMENT=web
+            -sALLOW_MEMORY_GROWTH=1
+            -sINITIAL_MEMORY=256MB
+            -sSTACK_SIZE=8MB
+            -sEXPORTED_RUNTIME_METHODS=FS,ENV
+            --emit-symbol-map
+            -lidbfs.js
+            "--embed-file=${dsp_rom}@/app/dsp_coef.bin"
+            "--embed-file=${bootstrap}@/app/wii_bootstrap")
+    elseif(NOT MKW_WEB_THREADS STREQUAL "jspi")
+        message(FATAL_ERROR "MKW_WEB_THREADS must be jspi or baton, not '${MKW_WEB_THREADS}'")
+    else()
+        target_link_options(${target} PRIVATE
+            -sJSPI
+            "-sJSPI_EXPORTS=main,mkw_host_context_entry"
+            -sENVIRONMENT=web
+            -sALLOW_MEMORY_GROWTH=1
+            # The translated game's static data alone is ~24 MB (above the 16 MB default), and the
+            # guest MEM1/MEM2 stores (152 MiB) are allocated at startup anyway.
+            -sINITIAL_MEMORY=256MB
+            -sMAXIMUM_MEMORY=4GB
+            # The main stack hosts the scheduler; guest threads own their own shadow stacks.
+            -sSTACK_SIZE=8MB
+            -sEXPORTED_RUNTIME_METHODS=FS,ENV
+            # <target>.js.symbols maps wasm function indices to names, so a stack from a player's
+            # error report ("wasm-function[N]") can be symbolized without shipping a name section.
+            --emit-symbol-map
+            -lidbfs.js
+            "--embed-file=${dsp_rom}@/app/dsp_coef.bin"
+            "--embed-file=${bootstrap}@/app/wii_bootstrap")
+    endif()
     foreach(library IN LISTS js_libraries)
         target_link_options(${target} PRIVATE "--js-library=${library}")
         set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${library}")
     endforeach()
+    if(MKW_WEB_THREADS STREQUAL "baton")
+        mkw_web_baton_link_options(${target} "${web_dir}")
+    endif()
     # For web/build.sh: the site assembly copies these next to index.html.
     if(MKW_PLATFORM_WEB_DIST)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory "${MKW_PLATFORM_WEB_DIST}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE_DIR:${target}>/${target}.js"
-                "$<TARGET_FILE_DIR:${target}>/${target}.wasm"
+                "$<TARGET_FILE_DIR:${target}>/$<TARGET_FILE_BASE_NAME:${target}>.js"
+                "$<TARGET_FILE_DIR:${target}>/$<TARGET_FILE_BASE_NAME:${target}>.wasm"
                 "${MKW_PLATFORM_WEB_DIST}")
     endif()
 endfunction()

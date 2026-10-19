@@ -11,7 +11,11 @@
 #include <chrono>
 #include <cstdint>
 
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+// [Eggy] Baton build (MKW_WEB_THREADS=baton, no JSPI): the guest runs on workers, which may
+// block. See runtime/src/host_context.cpp and web/js/baton/library_mkw_baton.js.
+#include <thread>
+#elif defined(__EMSCRIPTEN__)
 extern "C" void mkw_host_yield(int ms);
 extern "C" int mkw_host_page_hidden(void);
 extern "C" void mkw_host_wait_visible(void);
@@ -30,7 +34,39 @@ inline std::atomic<int64_t>& ParkedNanosCounter() {
 }
 inline int64_t ParkedNanos() { return ParkedNanosCounter().load(std::memory_order_relaxed); }
 
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+// Guest threads are workers here: the browser main thread renders and takes input on its own, so
+// there is nothing to yield to, and a sleep is a real blocking wait (Atomics.wait, sub-ms).
+inline void Yield() {}
+
+template <typename Clock, typename Duration>
+inline void SleepUntil(std::chrono::time_point<Clock, Duration> deadline) {
+    std::this_thread::sleep_until(deadline);
+}
+
+// Kept in shared memory by the page's visibilitychange listener (host_context.cpp).
+bool PageHidden();
+// Blocks the calling guest thread (and so the whole console, which only ever runs on the baton
+// holder) until the page is visible again; returns how long that took.
+std::chrono::steady_clock::duration WaitWhilePageHidden();
+// Counts the frame for the page and, every few seconds, logs what the baton costs per frame.
+void NoteFramePresented();
+
+// Diagnostics in shared memory (mkw_baton_counters() in host_context.cpp), bumped by the
+// runtime and by web/js/baton/library_mkw_baton.js (slots 0 and 1). Microsecond sums wrap;
+// only differences are ever read.
+enum BatonCounter : uint32_t {
+    kBatonJsCalls = 0,       // JS library calls a worker proxied to the browser main thread
+    kBatonJsCallMicros = 1,  // ... and the time the worker spent blocked on them
+    kBatonHandOffs = 2,      // HostContext::Switch calls
+    kBatonHandOffMicros = 3, // hand-off to the moment the destination runs (futex wake latency)
+    kBatonFrames = 4,        // frames presented
+    kBatonMainCalls = 5,     // aurora entry points run on the browser main thread
+    kBatonMainCallMicros = 6,
+    kBatonCounterCount = 8,
+};
+std::atomic<uint32_t>* BatonCounters();
+#elif defined(__EMSCRIPTEN__)
 // A single macrotask hop: the browser renders, delivers input and settles
 // promises, then this stack resumes (no setTimeout clamp).
 inline void Yield() { mkw_host_yield(0); }

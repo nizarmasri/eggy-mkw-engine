@@ -3,7 +3,10 @@
 // game's own files (same origin).
 //
 // Startup sequence
-//   1. check WebGPU + JSPI support (clear message naming Chrome/Edge 137+ when missing)
+//   1. check WebGPU + JSPI support (clear message naming Chrome/Edge 137+ when missing); without
+//      JSPI a cross-origin isolated page can still run a "baton" product (products.json
+//      "threads":"baton": pthreads instead of JSPI, see EGGY.md). ?nojspi removes JSPI from the
+//      page first, to prove a module runs without it
 //   2. read products.json (optional); with several products ask which one to play (or honour
 //      ?product=ID); the choice sets Module.mkwProduct and which glue/.wasm pair is used
 //   3. fetch the .wasm ourselves so we can show real download progress; it is handed to the
@@ -40,6 +43,7 @@
   let wasmUrl = wasmFile;                 // what is actually fetched (content-hashed when known)
   let wasmHashed = false;
   let wasmSizes = { raw: 0, gz: 0, br: 0 };
+  let productThreads = 'jspi'; // "jspi" or "baton" (products.json "threads"), for the error report
   function wasmNameFor(glue) { return glue.replace(/\.js$/i, '') + '.wasm'; }
   /**
    * Set to the exported factory name (e.g. 'createWiiCompiled') if the build uses
@@ -108,6 +112,19 @@
       pushLog(level.toUpperCase().padEnd(5, ' '), arguments);
       original.apply(null, arguments);
     };
+  }
+
+  // [Eggy] ?nojspi: take JSPI away from this page before any glue loads, as a browser without it
+  // (Safari 26) would be. Only a "baton" product can run then.
+  if (new URLSearchParams(location.search).has('nojspi') && typeof WebAssembly === 'object') {
+    for (const name of ['Suspending', 'promising']) {
+      try { delete WebAssembly[name]; } catch (_) { /* not configurable */ }
+      if (typeof WebAssembly[name] !== 'undefined') {
+        try { Object.defineProperty(WebAssembly, name, { value: undefined, configurable: true, writable: true }); } catch (_) { /* frozen */ }
+      }
+    }
+    console.log('[ios26] ?nojspi: removed WebAssembly.Suspending and WebAssembly.promising before the glue loads ' +
+      '(now ' + typeof WebAssembly.Suspending + ' / ' + typeof WebAssembly.promising + ')');
   }
 
   // ---------------------------------------------------------------------------------------
@@ -232,6 +249,7 @@
     out.push('secure ctx: ' + window.isSecureContext);
     out.push('gpu:        ' + gpuInfoText);
     out.push('jspi:       ' + (typeof WebAssembly !== 'undefined' && typeof WebAssembly.Suspending === 'function'));
+    out.push('threads:    ' + productThreads + ' (crossOriginIsolated ' + (window.crossOriginIsolated === true) + ')');
     out.push('screen:     ' + innerWidth + 'x' + innerHeight + ' @' + (window.devicePixelRatio || 1) + 'x');
     out.push('');
     out.push('--- errors ---');
@@ -717,6 +735,10 @@
     try { return await Promise.race([promise, timeout]); } finally { clearTimeout(timer); }
   }
 
+  // Which kinds of module this browser can run (set by checkCompatibility): "jspi" needs JSPI,
+  // "baton" needs SharedArrayBuffer, i.e. a cross-origin isolated page. [Eggy]
+  const support = { jspi: false, baton: false };
+
   async function checkCompatibility() {
     const problems = [];
     el.checks.hidden = false;
@@ -725,9 +747,19 @@
     // WebAssembly + JSPI (JavaScript Promise Integration), shipped in Chrome/Edge 137.
     const wasmOk = typeof WebAssembly === 'object';
     const jspiOk = wasmOk && typeof WebAssembly.Suspending === 'function';
-    if (!addCheck(jspiOk, 'WebAssembly JSPI (JavaScript Promise Integration)',
-      jspiOk ? '' : (wasmOk ? 'WebAssembly.Suspending is missing.' : 'WebAssembly is disabled.'))) {
-      problems.push('WebAssembly JSPI');
+    // Without JSPI the "baton" build runs its guest threads as workers instead (EGGY.md).
+    const batonOk = wasmOk && window.crossOriginIsolated === true &&
+      typeof SharedArrayBuffer === 'function' && typeof Atomics === 'object';
+    support.jspi = jspiOk;
+    support.baton = batonOk;
+    if (jspiOk || !batonOk) {
+      if (!addCheck(jspiOk, 'WebAssembly JSPI (JavaScript Promise Integration)',
+        jspiOk ? '' : (wasmOk ? 'WebAssembly.Suspending is missing, and the page is not cross-origin isolated ' +
+          '(no SharedArrayBuffer) for the threaded build either.' : 'WebAssembly is disabled.'))) {
+        problems.push('WebAssembly JSPI');
+      }
+    } else {
+      addCheck(true, 'WebAssembly threads (SharedArrayBuffer)', 'No JSPI here: the threaded build runs instead.');
     }
 
     // WebGPU
@@ -776,7 +808,9 @@
     el.compatError.append(strong,
       'Missing: ' + problems.join(' and ') + '. WiiCompiled needs WebGPU and WebAssembly JSPI, ' +
       'which are available in current Google Chrome or Microsoft Edge, version 137 or newer, on desktop. ' +
-      'Other browsers may not support this combination yet.');
+      'Other browsers may not support this combination yet.' +
+      (support.baton && !support.jspi && problems.includes('a build for this browser')
+        ? ' This site has no threaded build, which is what browsers without JSPI (such as Safari) run.' : ''));
   }
 
   // ---------------------------------------------------------------------------------------
@@ -810,6 +844,8 @@
       id: id,
       title: typeof raw.title === 'string' && raw.title ? raw.title : id,
       glue: glue,
+      // [Eggy] "baton": built without JSPI, guest threads on workers (needs cross-origin isolation).
+      threads: raw.threads === 'baton' ? 'baton' : 'jspi',
       wasm: wasm,
       wasmSizes: wasm ? { raw: size(raw.wasmSize), gz: size(raw.wasmGzSize), br: size(raw.wasmBrSize) } : { raw: 0, gz: 0, br: 0 },
       modRoot: modRoot,
@@ -820,15 +856,29 @@
 
   /** products.json -> array of products; falls back to the single default product. */
   async function loadProducts() {
-    const fallback = [{ id: 'WiiCompiled', title: 'Mario Kart Wii', glue: DEFAULT_GLUE_SCRIPT, wasm: null,
+    const fallback = [{ id: 'WiiCompiled', title: 'Mario Kart Wii', glue: DEFAULT_GLUE_SCRIPT, threads: 'jspi', wasm: null,
       wasmSizes: { raw: 0, gz: 0, br: 0 }, modRoot: null, modManifest: null }];
     try {
       const resp = await fetch(PRODUCTS_FILE, { cache: 'no-cache' });
       if (!resp.ok) return fallback;
       const list = await resp.json();
       const products = (Array.isArray(list) ? list : []).map(normalizeProduct).filter(Boolean);
-      const seen = new Set();
-      const unique = products.filter((p) => !seen.has(p.id) && seen.add(p.id));
+      // [Eggy] A product may come in both kinds (same id): the JSPI module where JSPI exists, else
+      // the baton one. A product this browser cannot run is left out.
+      const runnable = (p) => (p.threads === 'baton' ? support.baton : support.jspi);
+      const order = [];
+      const byId = new Map();
+      for (const p of products) {
+        if (!byId.has(p.id)) { order.push(p.id); byId.set(p.id, []); }
+        byId.get(p.id).push(p);
+      }
+      const unique = [];
+      for (const id of order) {
+        const kinds = byId.get(id).filter(runnable);
+        const pick = kinds.find((p) => p.threads === 'jspi' && support.jspi) || kinds[0];
+        if (pick) unique.push(pick);
+      }
+      if (!unique.length && products.length) return [];
       return unique.length ? unique : fallback;
     } catch (e) {
       console.warn('ignoring ' + PRODUCTS_FILE + ': ' + (e && e.message || e));
@@ -837,6 +887,8 @@
   }
 
   function applyProduct(product) {
+    productThreads = product.threads || 'jspi';
+    if (productThreads === 'baton') console.log('[ios26] running the baton build ' + product.glue + ' (no JSPI)');
     glueScript = product.glue;
     wasmFile = wasmNameFor(glueScript);
     wasmUrl = product.wasm || wasmFile;
@@ -1095,6 +1147,10 @@
       return;
     }
     const products = await loadProducts();
+    if (!products.length) {
+      showIncompatible(['a build for this browser']);
+      return;
+    }
     const product = await chooseProduct(products);
     applyProduct(product);
     el.changeProduct.hidden = products.length < 2;
