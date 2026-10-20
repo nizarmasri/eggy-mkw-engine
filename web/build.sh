@@ -533,12 +533,17 @@ elif [[ -f "$prebuilt_archive" && -f "$prebuilt_archive.sha256" ]]; then
     info "using the prebuilt web libraries (aurora, SDL3, ...): only the runtime and the game compile"
 fi
 
+# Extra configure arguments from the caller, split on spaces (Eggy's CI: ccache for the
+# precompiled headers).
+read -r -a extra_cmake_args <<< "${MKW_CMAKE_ARGS:-}"
+
 step "Configuring the WebAssembly build (emcmake)"
 emcmake cmake -S "$workspace/runtime" -B "$cmake_build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DMKW_PLATFORM_WEB_DIST="$out_dir" \
     -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs" \
-    ${prebuilt_args[@]+"${prebuilt_args[@]}"}
+    ${prebuilt_args[@]+"${prebuilt_args[@]}"} \
+    ${extra_cmake_args[@]+"${extra_cmake_args[@]}"}
 
 targets=("$BASE_TARGET")
 if ((build_retro)); then targets+=("$RETRO_TARGET"); fi
@@ -613,7 +618,10 @@ printf '%s\n' "$products_json" > "$out_dir/products.json"
 # Content-hash the wasm files (cache forever), write .gz/.br next to them and record the names and
 # sizes in products.json. See docs/web-hosting.md ("Caching and compression").
 step "Hashing and precompressing the wasm files"
-"$python_bin" "$precompress_tool" "$out_dir" || fail "precompress_dist.py failed"
+# MKW_PRECOMPRESS_ARGS: extra arguments, split on spaces (Eggy's CI passes --no-brotli: its pack
+# compresses every chunk itself).
+read -r -a precompress_args <<< "${MKW_PRECOMPRESS_ARGS:-}"
+"$python_bin" "$precompress_tool" "$out_dir" ${precompress_args[@]+"${precompress_args[@]}"} || fail "precompress_dist.py failed"
 info "products.json: $(cat "$out_dir/products.json")"
 
 # ---------------------------------------------------------------------------

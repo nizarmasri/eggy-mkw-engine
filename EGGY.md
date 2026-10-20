@@ -23,6 +23,7 @@ repository from a pinned commit of this one.
 | `runtime/cmake/PublicProducts.cmake` | `MKW_WEB_THREADS` (`jspi` default, or `baton`): the baton branch links `<Target>Baton.js/.wasm` without `-sJSPI` (cmake/WebBaton.cmake); the post-build copy uses `$<TARGET_FILE_BASE_NAME>` (the same names for JSPI). | Same. |
 | `web/build.sh` | `MKW_WEB_THREADS=baton`: no prebuilt, `-pthread` everywhere and `SDL_PTHREADS=ON`, its own CMake directory `wasm-baton`, `WiiCompiledBaton.js` and `"threads":"baton"` in products.json. Default output unchanged. | Same. |
 | `web/site/main.js` | `?nojspi` deletes `WebAssembly.Suspending`/`promising` before anything loads; without JSPI a cross-origin isolated page runs a `"threads":"baton"` product (JSPI preferred when a product has both). | Same, and to prove a module needs no JSPI. |
+| `web/build.sh` | `MKW_CMAKE_ARGS` is added to the configure, and `MKW_PRECOMPRESS_ARGS` to `precompress_dist.py`; both are unset by default. | Eggy's CI caches compiles that use the precompiled headers through ccache (it passes a project include with `-Xclang -fno-pch-timestamp`), and skips the brotli copy of the wasm, which its pack never reads. |
 
 ## Added
 
