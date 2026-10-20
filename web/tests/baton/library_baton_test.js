@@ -9,4 +9,13 @@ addToLibrary({
   baton_test_async_on_main: (ms) => new Promise((resolve) => {
     setTimeout(() => resolve(typeof document == 'object' ? 7 : -1), ms);
   }),
+
+  // The same through an `async` function (the form of mkw_dvd_load_manifest and
+  // mkw_storage_flush), which the baton library turns into a plain promise-returning one.
+  baton_test_async_function__proxy: 'sync',
+  baton_test_async_function__async: true,
+  baton_test_async_function: async (x) => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return typeof document == 'object' ? x + 1 : -1;
+  },
 });

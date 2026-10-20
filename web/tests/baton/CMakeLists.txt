@@ -34,7 +34,7 @@ add_executable(baton_test
     "${MKW_REPO}/runtime/src/host_context.cpp"
     "${MKW_REPO}/runtime/src/platform/web/baton_main_thread.cpp")
 target_include_directories(baton_test PRIVATE "${MKW_REPO}/runtime/include")
-target_link_libraries(baton_test PRIVATE aurora::core aurora::gx)
+target_link_libraries(baton_test PRIVATE aurora::core aurora::gx aurora::vi)
 # Emscripten's default shell page (it has <canvas id="canvas">).
 set_target_properties(baton_test PROPERTIES SUFFIX ".html")
 target_link_options(baton_test PRIVATE
@@ -42,6 +42,13 @@ target_link_options(baton_test PRIVATE
     -sALLOW_MEMORY_GROWTH=1
     -sINITIAL_MEMORY=64MB
     -sSTACK_SIZE=1MB
-    "--js-library=${MKW_REPO}/web/js/library_mkw_host.js"
-    "--js-library=${CMAKE_CURRENT_LIST_DIR}/library_baton_test.js")
+    -lidbfs.js
+    "--pre-js=${CMAKE_CURRENT_LIST_DIR}/baton_test_pre.js")
+# The product's web libraries, in the product's order, then the test's own, then the baton
+# library (cmake/PublicProducts.cmake does the same): the baton library decorates all of them.
+file(GLOB mkw_web_js_libraries "${MKW_REPO}/web/js/*.js")
+foreach(library IN LISTS mkw_web_js_libraries)
+    target_link_options(baton_test PRIVATE "--js-library=${library}")
+endforeach()
+target_link_options(baton_test PRIVATE "--js-library=${CMAKE_CURRENT_LIST_DIR}/library_baton_test.js")
 mkw_web_baton_link_options(baton_test "${MKW_REPO}/web")

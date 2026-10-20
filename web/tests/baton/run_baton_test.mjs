@@ -10,7 +10,9 @@
 //   * main() and the guest contexts run on workers, aurora's SDL window steps on the main thread,
 //     the WebGPU instance without TimedWaitAny (its waits poll), aurora waits for a 0x0 canvas;
 //   * "BATON-TEST PASS": thread_locals shared across contexts, exceptions and recursion inside
-//     them, a proxied promise that blocks the worker, frames presented from a guest context;
+//     them, a proxied promise (and an `async` function) that blocks the worker, the product's
+//     own disc/storage/eggy imports answering from the main thread, frames presented from a
+//     guest context;
 //   * the canvas shows the colour the guest cleared it to (GXSetCopyClear 200,40,160);
 //   * no WebGPU validation error, page error, abort or trap.
 // Prints the measured hand-off and main-thread costs. Exit code 0 on success.
@@ -190,6 +192,7 @@ try {
 
   need(/^\[ios26\] baton glue on the browser main thread: JSPI absent/, 'the baton glue line on the main thread');
   need(/^\[baton-test\] main\(\) on a worker/, 'main() on a worker');
+  need(/^\[baton-test\] product imports on the main thread/, "the product's disc, storage and eggy imports answering from the main thread");
   need(/^\[ios26\] aurora: window::initialize .* on the browser main thread/, 'SDL window setup on the main thread');
   need(/^\[ios26\] aurora: WebGPU instance without TimedWaitAny/, 'the WebGPU instance without TimedWaitAny');
   need(/Canvas is ready; creating the surface/, 'aurora creating the surface once the canvas was shown');

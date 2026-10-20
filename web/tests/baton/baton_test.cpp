@@ -29,8 +29,32 @@
 #include <string>
 
 // web/tests/baton/library_baton_test.js: an `__async` import proxied 'sync', i.e. a promise the
-// worker blocks on (the mechanism behind every disc read of the baton build).
+// worker blocks on (the mechanism behind every disc read of the baton build), and the same
+// through an `async` function.
 extern "C" int baton_test_async_on_main(int ms);
+extern "C" int baton_test_async_function(int x);
+
+// The product's own imports (web/js/*.js, linked here as in the product), each proxied to the
+// main thread by web/js/baton/library_mkw_baton.js. The test calls the ones that are safe without
+// a disc or an Eggy page and keeps the rest linked, so their proxies are generated too.
+extern "C" {
+char* mkw_dvd_load_manifest(int mount);
+int32_t mkw_dvd_read(int mount, const char* relPath, double offset, uint32_t length, uint8_t* dest);
+char* mkw_dvd_mod_mount_name(void);
+int mkw_storage_flush(void);
+int mkw_storage_is_persistent(void);
+int mkw_storage_is_readonly(void);
+void mkw_input_attach(void* state, uint32_t size, void* touch);
+void mkw_input_describe(const char* json);
+void mkw_host_report_fatal(const char* message);
+int eggy_enabled(void);
+void eggy_attach(int32_t* block, int bytes);
+void eggy_wait(int ms);
+int eggy_pads(int frame, uint8_t* dest);
+void eggy_frame_done(int frame);
+void eggy_state(int state);
+void eggy_report_ready(void);
+}
 
 namespace {
 
@@ -50,6 +74,8 @@ thread_local int t_turn = 0;
 thread_local std::string t_text;
 
 int g_rounds = 0;
+// Never set: keeps the imports the test does not call in the link.
+volatile bool g_never = false;
 
 [[noreturn]] void Fail(const std::string& why)
 {
@@ -128,6 +154,37 @@ void RendererEntry(void*)
     if (answer != 7) Fail("the proxied promise returned " + std::to_string(answer) + " instead of 7 (not run on the main thread?)");
     if (asyncMs < 35.0) Fail("the proxied promise did not block the worker (" + std::to_string(asyncMs) + " ms)");
     std::printf("[baton-test] a promise on the main thread blocked this worker for %.1f ms (asked 40)\n", asyncMs);
+    const int plus = baton_test_async_function(7);
+    if (plus != 8) Fail("the proxied async function returned " + std::to_string(plus) + " instead of 8");
+
+    // The product's imports, on the page's side.
+    if (eggy_enabled() != 0) Fail("eggy_enabled() is not 0 on a page without Module.eggy");
+    const double waitStart = emscripten_get_now();
+    eggy_wait(30); // resolves through Eggy.wake() on the main thread when the 30 ms pass
+    const double waitMs = emscripten_get_now() - waitStart;
+    if (waitMs < 25.0) Fail("eggy_wait(30) returned after " + std::to_string(waitMs) + " ms");
+    const int persistent = mkw_storage_is_persistent();
+    const int readOnly = mkw_storage_is_readonly();
+    char* modName = mkw_dvd_mod_mount_name();
+    std::printf("[baton-test] product imports on the main thread: eggy_enabled 0, eggy_wait(30) %.1f ms, "
+                "storage persistent %d read-only %d, mod mount '%s'\n",
+                waitMs, persistent, readOnly, modName ? modName : "(none)");
+    std::free(modName);
+    if (g_never) {
+        uint8_t bytes[16] = {};
+        int32_t block[4] = {};
+        std::free(mkw_dvd_load_manifest(0));
+        mkw_dvd_read(0, "sys/main.dol", 0.0, 16, bytes);
+        mkw_storage_flush();
+        mkw_input_attach(bytes, sizeof bytes, bytes);
+        mkw_input_describe("{}");
+        mkw_host_report_fatal("never");
+        eggy_attach(block, sizeof block);
+        eggy_pads(0, bytes);
+        eggy_frame_done(0);
+        eggy_state(0);
+        eggy_report_ready();
+    }
 
     const auto start = std::chrono::steady_clock::now();
     int frames = 0;

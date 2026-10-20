@@ -40,6 +40,26 @@
   const proxy = (key, mode) => {
     if (typeof lib[key] == 'function' && lib[key + '__proxy'] === undefined) lib[key + '__proxy'] = mode;
   };
+  // A proxied import whose result is a promise (`__async`, or an `async` function) needs two
+  // things Emscripten does not do for it without JSPI/Asyncify: the function itself must not be
+  // `async` (Emscripten would then wrap the proxying stub in an async function, and the worker
+  // would get a Promise object where it expects the value), and a rejection must not leave the
+  // worker waiting forever (Emscripten only handles fulfilment). So it becomes a plain function
+  // returning the original's promise, and a rejection aborts the module with the reason, which
+  // is what the JSPI build does when the promise of a suspending import rejects.
+  const promiseImport = (key) => {
+    const src = lib[key].toString();
+    const m = /^(?:async\s*)?(?:function\b[^(]*)?\(([^)]*)\)/.exec(src) || /^(?:async\s+)?([A-Za-z_$][\w$]*)\s*=>/.exec(src);
+    if (!m) {
+      error(`[ios26] ${key}: cannot make this function form a proxied promise import`);
+      return;
+    }
+    const args = m[1].trim();
+    lib[key] = (0, eval)(`(${args}) => Promise.resolve((${src})(${args})).catch((e) => {
+      err('[ios26] ${key} failed on the main thread: ' + (e && e.stack || e));
+      abort(e);
+    })`);
+  };
   // web/js/library_mkw_dvd.js: the disc (fetch or Module.mkwDiscSource) and the save store.
   for (const key of ['mkw_dvd_load_manifest', 'mkw_dvd_read', 'mkw_dvd_mod_mount_name',
                      'mkw_storage_flush', 'mkw_storage_is_persistent', 'mkw_storage_is_readonly']) {
@@ -64,6 +84,11 @@
       continue;
     }
     proxy(key, 'sync');
+  }
+  for (const key of Object.keys(lib)) {
+    if (!/^(mkw_|eggy_|baton_test_)/.test(key) || isDecorator(key) || typeof lib[key] != 'function') continue;
+    if (lib[key + '__proxy'] !== 'sync') continue;
+    if (lib[key + '__async'] || /^async\b/.test(lib[key].toString())) promiseImport(key);
   }
 })();
 
