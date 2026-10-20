@@ -213,3 +213,11 @@ headless Chromium with JSPI deleted (cross-origin isolated, SwiftShader WebGPU):
 their own workers sharing TLS, a proxied promise blocking a worker, frames presented from a
 guest context in the colour the guest cleared to. In the data repo, `build.yml` with
 `variant=baton` builds the game and `smoke.yml` with `path=/?nojspi=1` boots it without JSPI.
+
+**Status.** The test passes in CI (ios26 run 39378346856, Chromium on a 4-core runner,
+SwiftShader WebGPU, JSPI deleted): aurora initializes on a worker after waiting for the 0x0
+canvas, 60 frames/s presented from a guest context, the canvas shows the guest's clear colour.
+Measured there: a hand-off reaches the other worker in 10-25 us; an aurora frame call on the main
+thread takes 0.13-0.2 ms (3 a frame); a proxied JS call about 30 us; the guest waits on the main
+thread 3-9% of the time. The game itself has not been built as baton yet (the data repo's CI is
+blocked by billing).
