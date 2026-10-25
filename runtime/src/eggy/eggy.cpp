@@ -59,6 +59,11 @@ void eggy_report_ready() {}
 // The game's own functions the hooks wrap (translated bodies; the hooks below win the dispatch).
 extern "C" void func_805302C4(CpuContext* ctx); // System::RaceConfig::initRace
 extern "C" void func_8051AF84(CpuContext* ctx); // System::GameScene::setFramerate(bool is30)
+extern "C" void func_80856278(CpuContext* ctx); // Pages::RaceHUD::OnInit
+extern "C" void func_80856CEC(CpuContext* ctx); // Pages::RaceHUD::BeforeControlUpdate
+extern "C" void func_808574B8(CpuContext* ctx); // Pages::RaceHUD::AfterControlUpdate
+extern "C" void func_80858A50(CpuContext* ctx); // Pages::RaceHUD::OnItemObjTargeting
+extern "C" void func_80858AE4(CpuContext* ctx); // Pages::RaceHUD::UpdateRaceBalloons
 
 namespace {
 
@@ -111,6 +116,11 @@ constexpr uint32_t kSectionVs1P = 0x20, kSectionTeamVs1P = 0x24, kSectionBattle1
 // RaceConfig: race scenario at +0x20, menu scenario at +0xC10. Scenario: +4 playerCount, +5 hudCount,
 // +6 localPlayerCount, +7 hudCount (second copy); players at +8 (0xF0 each); settings at +0xB48.
 constexpr uint32_t kRaceScenario = 0x20, kMenuScenario = 0xC10, kScenarioPlayers = 8, kPlayerSize = 0xF0;
+constexpr uint32_t kLocalPlayerCount = 6;
+
+// RaceCameraMgr: +0x14 cameras (one per screen: camera i follows hudPlayerIds[i]; one per player only
+// in live view), RaceCamera +0x9C playerId. Pages::RaceHUD instance: +0x60 hudHasPlayer[4].
+constexpr uint32_t kRaceHud = 0x809C4680;
 
 constexpr uint16_t kRaceButtons = 0x0F7F; // every GameCube button but Start
 constexpr uint16_t kPadL = 0x0040, kPadR = 0x0020;
@@ -159,6 +169,7 @@ bool g_padsLive = false; // g_shared[kPads] holds the pads of the frame being ca
 std::array<int, 4> g_slotOfPort{-1, -1, -1, -1};
 int g_mySlot = 0;
 int g_humans = 0;
+bool g_oneHudSlot = false; // the race's HUD page sees one local player (OneHudSlot, below)
 int g_field = 0;
 bool g_mirror = false;
 bool g_battle = false;
@@ -300,6 +311,13 @@ int RaceFrames() {
     const uint32_t rm = RaceManager();
     return rm ? static_cast<int>(R32(rm + 0x20)) : 0;
 }
+// The player race camera `i` follows (-1 when there is no such camera).
+int CameraPlayer(uint32_t cm, int i) {
+    if (!cm || i < 0 || static_cast<uint32_t>(i) >= R32(cm + 0x1C)) return -1;
+    const uint32_t cameras = Ptr(cm + 0x14);
+    const uint32_t camera = cameras ? Ptr(cameras + static_cast<uint32_t>(i) * 4) : 0;
+    return camera ? R8(camera + 0x9C) : -1;
+}
 
 // ---- Binding a local player to a GameCube port ----
 uint32_t GcnPad(int port) {
@@ -401,6 +419,7 @@ bool StartLoad() {
         std::printf("[eggy] section change while fade action %u is pending\n", R32(sm + 0x30));
         W32(sm + 0x30, 2);
     }
+    g_oneHudSlot = g_humans > 1;
     g_initRaceSeen = false;
     g_frame = 0;
     g_padsLive = false;
@@ -463,11 +482,27 @@ void WriteSeeds(uint32_t scenario) {
     W32(scenario + 0xB78, seed ^ 0x9E3779B9u);
 }
 
-// One screen whatever the number of humans: HUD and camera follow this phone's player only. The
-// others stay local players (their pads drive their karts) without a screen of their own. This is
-// the shape Scenario::initRace (0x8052FB90) itself gives the VS intro (camera mode 5): screen
-// count (+5) 1 while every local player keeps a local number (player +5) and a hudPlayerIds
-// entry. Here this phone's player is local 0 (the one screen), the other humans 1.. in slot order.
+// One screen whatever the number of humans: camera, HUD and sound listener follow this phone's
+// player only. The others stay local players (their pads drive their karts) without a screen of
+// their own. This is the shape Scenario::initRace (0x8052FB90) itself gives the VS intro (camera
+// mode 5): screen count (+5) 1 while every local player keeps a local number (player +5) and a
+// hudPlayerIds entry. Here this phone's player is local 0 (the one screen), the other humans 1..
+// in slot order.
+//
+// What reads which (disassembly of RMCP01, EGGY.md):
+// - The screen count sizes the cameras (RaceCameraMgr ctor: camera i is built for
+//   GetPlayerIdOfLocalPlayer(i) = hudPlayerIds[i]), the audio listeners (Audio::RaceMgr) and the
+//   Lakitus, so one camera, one listener and one Lakitu follow hudPlayerIds[0] natively.
+// - localPlayerCount (+6) stays the number of humans: the race needs it. The AI walks that many
+//   real players (AI::Manager::GetLocalPlayerCount, list filled by type in slot order) and course
+//   objects size per-local-kart buffers by it (e.g. 0x80753B34 writes one entry per REAL_LOCAL kart).
+// - Pages::RaceHUD lays out and loops over its HUD slots by localPlayerCount, not by screens; the
+//   OneHudSlot hooks below show it one.
+// - Local numbers and hudPlayerIds reach nothing that changes the race: kart "local" status,
+//   race end (GMDataVS::CanRaceEnd), items (DriverMgr::IsPlayerComputer) and the AI's real players
+//   all go by player type; the rest is camera, HUD, sound, effects and models.
+// RaceCameraMgr::ChangeFocusedPlayer (0x805A9B04) is live view's switch: it indexes cameras by
+// player id, which only holds when live view built one camera per player. Never call it here.
 void PatchOneScreen(uint32_t rc) {
     const uint32_t race = rc + kRaceScenario;
     if (g_humans <= 1 && R8(race + 0xB64) == static_cast<uint8_t>(g_mySlot)) {
@@ -730,7 +765,7 @@ void WriteDiag() {
     d[7] = rc ? R8(rc + kRaceScenario + 5) : -1;
     d[8] = rc ? R8(rc + kRaceScenario + 6) : -1;
     for (int i = 0; i < 4; ++i) d[9 + i] = rc ? static_cast<int8_t>(R8(rc + kRaceScenario + 0xB64 + i)) : -2;
-    d[13] = cm ? R8(cm + 0x27) : -1;
+    d[13] = CameraPlayer(cm, 0);
     d[14] = static_cast<int32_t>(g_localHolder[0] ? R32(g_localHolder[0] + 4) : 0);
     d[15] = static_cast<int32_t>(g_localPad[0]);
     d[16] = static_cast<int32_t>(g_initRaceCalls);
@@ -742,14 +777,15 @@ void WriteDiag() {
     d[22] = static_cast<int32_t>(g_targetSection);
 }
 
-void OnParked(CpuContext* ctx) {
+void OnParked() {
     g_mtMax = std::max<int>(1, static_cast<int16_t>(R16(kMtMaxAddr)));
     g_smtMax = std::max<int>(1, static_cast<int16_t>(R16(kSmtMaxAddr)));
     const uint32_t cm = Ptr(kCameraManager);
-    if (cm && R8(cm + 0x27) != static_cast<uint8_t>(g_mySlot)) {
-        std::printf("[eggy] camera follows slot %u; focusing slot %d\n", R8(cm + 0x27), g_mySlot);
-        CallGuest<0x805A9B04>(ctx, static_cast<uint32_t>(g_mySlot)); // CameraManager::ChangeFocusedPlayer
-    }
+    const uint32_t hud = Ptr(kRaceHud);
+    std::printf("[eggy] screen: cameras %d, camera 0 follows slot %d (mine %d); HUD slots %d %d %d %d\n",
+                cm ? static_cast<int>(R32(cm + 0x1C)) : -1, CameraPlayer(cm, 0), g_mySlot,
+                hud ? R8(hud + 0x60) : -1, hud ? R8(hud + 0x61) : -1, hud ? R8(hud + 0x62) : -1,
+                hud ? R8(hud + 0x63) : -1);
     const int stage = Stage();
     for (int port = 0; port < 4; ++port) SnapshotKart(port, stage, RaceFrames());
     g_shared[kStage] = stage;
@@ -803,7 +839,7 @@ void PreCalc(CpuContext* ctx) {
             continue;
         case kLoading:
             if (LoadReady()) {
-                OnParked(ctx);
+                OnParked();
                 SetState(kParked);
                 continue;
             }
@@ -981,6 +1017,70 @@ extern "C" void Eggy_SetFramerate_8051AF84(CpuContext* ctx) {
     func_8051AF84(ctx);
 }
 REGISTER_NATIVE_FUNCTION_AS(0x8051AF84, Eggy_SetFramerate_8051AF84, "Eggy_SetFramerate_8051AF84");
+
+// The race's HUD page (Pages::RaceHUD) takes its number of HUD slots from localPlayerCount, not
+// from the screen count: OnInit makes one set of controls per local player and picks their layout
+// by that count (CtrlRaceRankNum_<count>_<slot>, ...), and every per-frame function loops over the
+// same count. With 2-4 humans on one screen it would draw the split-screen HUD of every local
+// player over one full-screen camera. These are all the RaceHUD functions that read the count
+// (RaceConfig race scenario +6, checked against every reader in the DOL/REL); while one of them
+// runs, the count reads 1, so the page is the 1P HUD of HUD slot 0, hudPlayerIds[0] = this
+// phone's player. The race itself (AI, objects, items) never runs inside them and keeps the real
+// count.
+namespace {
+struct OneHudSlot {
+    uint32_t addr = 0;
+    uint8_t saved = 0;
+    OneHudSlot() {
+        const uint32_t rc = g_oneHudSlot ? Ptr(kRaceConfig) : 0;
+        if (!rc) return;
+        addr = rc + kRaceScenario + kLocalPlayerCount;
+        saved = R8(addr);
+        W8(addr, 1);
+    }
+    ~OneHudSlot() {
+        if (addr) W8(addr, saved);
+    }
+    OneHudSlot(const OneHudSlot&) = delete;
+    OneHudSlot& operator=(const OneHudSlot&) = delete;
+};
+} // namespace
+
+extern "C" void Eggy_RaceHudOnInit_80856278(CpuContext* ctx) {
+    const OneHudSlot one;
+    func_80856278(ctx);
+}
+REGISTER_NATIVE_FUNCTION_AS(0x80856278, Eggy_RaceHudOnInit_80856278, "Eggy_RaceHudOnInit_80856278");
+
+extern "C" void Eggy_RaceHudBeforeControlUpdate_80856CEC(CpuContext* ctx) {
+    const OneHudSlot one;
+    func_80856CEC(ctx);
+}
+REGISTER_NATIVE_FUNCTION_AS(0x80856CEC, Eggy_RaceHudBeforeControlUpdate_80856CEC,
+                            "Eggy_RaceHudBeforeControlUpdate_80856CEC");
+
+extern "C" void Eggy_RaceHudAfterControlUpdate_808574B8(CpuContext* ctx) {
+    const OneHudSlot one;
+    func_808574B8(ctx);
+}
+REGISTER_NATIVE_FUNCTION_AS(0x808574B8, Eggy_RaceHudAfterControlUpdate_808574B8,
+                            "Eggy_RaceHudAfterControlUpdate_808574B8");
+
+// Called by red and blue shells (the targeted-player balloon).
+extern "C" void Eggy_RaceHudOnItemObjTargeting_80858A50(CpuContext* ctx) {
+    const OneHudSlot one;
+    func_80858A50(ctx);
+}
+REGISTER_NATIVE_FUNCTION_AS(0x80858A50, Eggy_RaceHudOnItemObjTargeting_80858A50,
+                            "Eggy_RaceHudOnItemObjTargeting_80858A50");
+
+// Called by RaceCameraMgr::Update (the name and item balloons above the karts).
+extern "C" void Eggy_RaceHudUpdateRaceBalloons_80858AE4(CpuContext* ctx) {
+    const OneHudSlot one;
+    func_80858AE4(ctx);
+}
+REGISTER_NATIVE_FUNCTION_AS(0x80858AE4, Eggy_RaceHudUpdateRaceBalloons_80858AE4,
+                            "Eggy_RaceHudUpdateRaceBalloons_80858AE4");
 
 namespace Eggy {
 
