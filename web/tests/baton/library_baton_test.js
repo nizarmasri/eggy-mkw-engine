@@ -18,4 +18,10 @@ addToLibrary({
     await new Promise((resolve) => setTimeout(resolve, 5));
     return typeof document == 'object' ? x + 1 : -1;
   },
+
+  // What Eggy's load(), go() and abort() do on the page: write a mailbox and wake the engine. The
+  // test calls it before eggy_wait, the order the page and the engine's worker can race into.
+  baton_test_wake_eggy__proxy: 'sync',
+  baton_test_wake_eggy__deps: ['$Eggy'],
+  baton_test_wake_eggy: () => Eggy.wake(),
 });

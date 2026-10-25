@@ -23,6 +23,7 @@ repository from a pinned commit of this one.
 | `runtime/cmake/PublicProducts.cmake` | `MKW_WEB_THREADS` (`jspi` default, or `baton`): the baton branch links `<Target>Baton.js/.wasm` without `-sJSPI` (cmake/WebBaton.cmake); the post-build copy uses `$<TARGET_FILE_BASE_NAME>` (the same names for JSPI). | Same. |
 | `web/build.sh` | `MKW_WEB_THREADS=baton`: no prebuilt, `-pthread` everywhere and `SDL_PTHREADS=ON`, its own CMake directory `wasm-baton`, `WiiCompiledBaton.js` and `"threads":"baton"` in products.json. Default output unchanged. | Same. |
 | `web/site/main.js` | `?nojspi` deletes `WebAssembly.Suspending`/`promising` before anything loads; without JSPI a cross-origin isolated page runs a `"threads":"baton"` product (JSPI preferred when a product has both). | Same, and to prove a module needs no JSPI. |
+| `runtime/src/hle/net/network_deferred.cpp` | The baton build (`__EMSCRIPTEN_PTHREADS__`) skips the check that the network pump always runs on one host thread. | Every baton context is its own pthread, so the check logged an error on about every frame of a race; every caller is guest code, i.e. the baton holder. |
 | `web/build.sh` | `MKW_CMAKE_ARGS` is added to the configure, and `MKW_PRECOMPRESS_ARGS` to `precompress_dist.py`; both are unset by default. | Eggy's CI caches compiles that use the precompiled headers through ccache (it passes a project include with `-Xclang -fno-pch-timestamp`), and skips the brotli copy of the wasm, which its pack never reads. |
 
 ## Added
@@ -199,7 +200,36 @@ the main thread, and the guest waits while the main thread encodes the frame (as
 JSPI, where everything was one thread). The build prints, every 3 s:
 `[ios26] baton: ... frames | hand-offs (n/frame, us to wake) | JS calls on the main thread
 (n/frame, us each) | aurora calls on the main thread (n/frame, ms each) | guest blocked on the
-main thread x% | live contexts`, and the main thread a heartbeat every 5 s.
+main thread x% | live contexts`, then the same costs by name, per frame and costliest first:
+`[ios26] baton by name, per frame: JS <import> <calls> (<wait>/<run> us) ... | aurora update ...
+begin_frame ... end_frame ... | hand-offs to #<context> <n> ...`, where "wait" is what the guest's
+worker was blocked (queueing behind other main-thread work included) and "run" what the main
+thread spent on the call (until its promise settled, for a promise import). Imports are counted
+by their index in Emscripten's `proxiedFunctionTable` (`web/js/baton/library_mkw_baton.js`
+wraps `proxyToMainThread` on the workers and the table's entries on the main thread); the context
+creation log names each context's guest OSThread. The main thread prints a heartbeat every 5 s
+with its own time on proxied JS and on aurora, and its longest stall.
+
+**Console output does not wait.** Every `printf` of a guest thread ends in the `fd_write`
+import, which Emscripten runs on the main thread (its file system lives there) while the worker
+waits: 1-4 ms a line on CI. The link wraps `__wasi_fd_write` (`baton_main_thread.cpp`): a
+worker's writes to descriptors 1 and 2 are copied and handed to the main thread with
+`emscripten_proxy_async`, where the real `fd_write` prints them as before (same TTY line
+buffering, `Module.print`/`printErr`); the system queue keeps them in order with the thread's
+other main-thread calls. Other descriptors keep the synchronous call.
+
+**Eggy mode.** `web/site/eggy/eggy-engine.js` loads products.json's `"threads":"baton"` entry
+on a cross-origin isolated page without JSPI (with JSPI it loads exactly what it did before), and
+`eggy.html?nojspi` removes JSPI first, like the stock page. Every `eggy_*` import runs on the main
+thread, where `Module.eggy` is. One thing JSPI never had to handle: the page now runs while the
+engine does, so `load()`, `go()` or `abort()` can wake the engine after it read its mailboxes and
+before its `eggy_wait` reached the main thread, and the engine then parked for good (the first
+baton Eggy smoke never left idle). The baton library rewrites `Eggy.wake` and `eggy_wait` from
+library_eggy.js's own source so that a wake finding nobody waiting is kept and the next wait
+returns at once (`eggy.cpp` re-reads its mailboxes and parks again if nothing is new). Per race
+frame Eggy mode adds two synchronous round trips, `eggy_pads` (the lockstep's wait) and
+`eggy_frame_done` (the page's `onFrame`, which sets render skip for the frame being drawn, so it
+stays synchronous).
 
 **Known limits.**
 - If `createRenderPipelineAsync` fails, aurora builds that pipeline synchronously in the
@@ -212,7 +242,9 @@ main thread x% | live contexts`, and the main thread a heartbeat every 5 s.
 **Testing.** `web/tests/baton/` builds aurora with `-pthread` and runs the pieces above in
 headless Chromium with JSPI deleted (cross-origin isolated, SwiftShader WebGPU): contexts on
 their own workers sharing TLS, a proxied promise blocking a worker, frames presented from a
-guest context in the colour the guest cleared to. In the data repo, `build.yml` with
+guest context in the colour the guest cleared to, 300 console lines from a worker that take
+under 150 ms and all arrive in order, a wake that reaches the page before `eggy_wait` (kept, and
+used once), and the per-name breakdown line. In the data repo, `build.yml` with
 `variant=baton` builds the game and `smoke.yml` with `path=/?nojspi=1` boots it without JSPI.
 
 **Status.** The test passes in CI (ios26 run 39378346856, Chromium on a 4-core runner,
@@ -220,5 +252,25 @@ SwiftShader WebGPU, JSPI deleted): aurora initializes on a worker after waiting 
 canvas, 60 frames/s presented from a guest context, the canvas shows the guest's clear colour.
 Measured there: a hand-off reaches the other worker in 10-25 us; an aurora frame call on the main
 thread takes 0.13-0.2 ms (3 a frame); a proxied JS call about 30 us; the guest waits on the main
-thread 3-9% of the time. The game itself has not been built as baton yet (the data repo's CI is
-blocked by billing).
+thread 3-9% of the time.
+
+**The game on CI (2026-10-25).** Data repo smokes, headless Chromium on a 2-core runner,
+SwiftShader WebGPU:
+- Stock page, `?nojspi=1` (engine-5f0a49d-baton, smoke 40231131789): within 240 s the attract
+  sequence is still in the title movie (THP), which ran at 4.6-5 frames/s (2.2-2.3 in an earlier
+  run, 40213351676, whose "race" statistics were the movie too: the race appears only in its last
+  screenshots). Per movie frame: 3 `wgpuQueueWriteTexture` (the Y/U/V planes) that each kept the
+  main thread busy about 49 ms on SwiftShader, 3 `wgpuDeviceCreateTexture`, 3
+  `wgpuTextureCreateView`, 2 `wgpuDeviceCreateBindGroup`, 0.8 `mkw_dvd_read` (the movie streaming
+  over HTTP, 8-40 ms each), 1.1 `fd_write` (the network pump error above), 2-3 `emwgpuDelete`, one
+  asynchronous `mkw_host_note_frame`; aurora `update` 8 (one per VI retrace, which runs on host
+  time: at 60 frames/s it is one a frame), `begin_frame` 1, `end_frame` 1 (0.6 ms); about 40
+  hand-offs, i.e. some 190 a second whatever the frame rate (audio and the retrace wake the
+  same few guest threads), 0.1 ms each. The main thread ran proxied WebGPU work 3.7 s of every 5.
+- The JSPI build on the same page (engine-b9770e3, smoke 40229811565) runs the movie and the race
+  at 2.2-2.4 frames/s: drawing every frame on SwiftShader is the limit there, for both builds, so
+  the stock page cannot tell them apart on this runner.
+- Eggy's test page is the comparison: `eggy.html?humans=1&finishAll=1500` (draws one race frame in
+  20) under JSPI (engine-b9770e3, smoke 40228689077) runs the race stage at 56-60 race frames/s
+  (frames 0-1500 in 42 s). The first baton run of it (engine-b3b9dbb-baton, smoke 40237304116)
+  booted to idle in 6.9 s and then parked for good on `load()`: the lost wake above, fixed since.

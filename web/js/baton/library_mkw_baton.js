@@ -85,6 +85,34 @@
     }
     proxy(key, 'sync');
   }
+  // A wake-up must not be lost between the engine reading its mailboxes and parking. Under JSPI the
+  // page can only write a mailbox while the engine is parked (one thread), but here the engine runs
+  // on a worker while the page runs: load(), go() or abort() can call Eggy.wake() after the engine
+  // looked and before its eggy_wait reached the main thread, which then waited for a wake that
+  // already happened (a smoke's race never loaded). So a wake that finds nobody waiting is kept,
+  // and the next eggy_wait returns at once; the engine re-reads its mailboxes and parks again if
+  // nothing is new (eggy.cpp ParkUntilMailbox loops). Both functions are rewritten from their own
+  // source, so library_eggy.js stays the one place they are written.
+  if (lib['$Eggy'] && typeof lib['$Eggy'].wake == 'function' && typeof lib['eggy_wait'] == 'function') {
+    const wake = lib['$Eggy'].wake.toString();
+    if (!/^wake\s*\(\s*\)\s*\{/.test(wake)) {
+      error('[ios26] library_eggy.js Eggy.wake() changed form; update web/js/baton/library_mkw_baton.js');
+    } else {
+      lib['$Eggy'].missedWake = false;
+      lib['$Eggy'].wake = (0, eval)(`(function () {
+        if (!Eggy.waiter) Eggy.missedWake = true;
+        ${wake.slice(wake.indexOf('{') + 1, wake.lastIndexOf('}'))}
+      })`);
+      const wait = lib['eggy_wait'].toString();
+      lib['eggy_wait'] = (0, eval)(`(ms) => {
+        if (Eggy.missedWake) {
+          Eggy.missedWake = false;
+          return Promise.resolve();
+        }
+        return (${wait})(ms);
+      }`);
+    }
+  }
   for (const key of Object.keys(lib)) {
     if (!/^(mkw_|eggy_|baton_test_)/.test(key) || isDecorator(key) || typeof lib[key] != 'function') continue;
     if (lib[key + '__proxy'] !== 'sync') continue;

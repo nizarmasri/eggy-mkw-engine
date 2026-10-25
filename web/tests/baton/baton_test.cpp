@@ -33,6 +33,8 @@
 // through an `async` function.
 extern "C" int baton_test_async_on_main(int ms);
 extern "C" int baton_test_async_function(int x);
+// Eggy.wake() on the main thread, as the page's load()/go()/abort() do.
+extern "C" void baton_test_wake_eggy(void);
 
 // The product's own imports (web/js/*.js, linked here as in the product), each proxied to the
 // main thread by web/js/baton/library_mkw_baton.js. The test calls the ones that are safe without
@@ -165,6 +167,21 @@ void RendererEntry(void*)
     eggy_wait(30); // resolves through Eggy.wake() on the main thread when the 30 ms pass
     const double waitMs = emscripten_get_now() - waitStart;
     if (waitMs < 25.0) Fail("eggy_wait(30) returned after " + std::to_string(waitMs) + " ms");
+    // A wake that reaches the page before the engine's wait does is not lost (library_mkw_baton.js):
+    // under the baton the page runs while the engine does, so Eggy's load() can land between the
+    // engine reading its mailboxes and parking. The wait must return at once, not after 2 s.
+    baton_test_wake_eggy();
+    const double lostStart = emscripten_get_now();
+    eggy_wait(2000);
+    const double lostMs = emscripten_get_now() - lostStart;
+    if (lostMs > 1000.0) Fail("a wake before eggy_wait was lost (the wait ran " + std::to_string(lostMs) + " ms)");
+    // ...and once it is used up, the next wait parks again until its timeout.
+    const double parkStart = emscripten_get_now();
+    eggy_wait(30);
+    const double parkMs = emscripten_get_now() - parkStart;
+    if (parkMs < 25.0) Fail("eggy_wait(30) after a kept wake returned after " + std::to_string(parkMs) + " ms");
+    std::printf("[baton-test] a wake before eggy_wait is kept: the wait returned in %.1f ms, the next one "
+                "parked %.1f ms\n", lostMs, parkMs);
     const int persistent = mkw_storage_is_persistent();
     const int readOnly = mkw_storage_is_readonly();
     char* modName = mkw_dvd_mod_mount_name();

@@ -193,6 +193,7 @@ try {
   need(/^\[ios26\] baton glue on the browser main thread: JSPI absent/, 'the baton glue line on the main thread');
   need(/^\[baton-test\] main\(\) on a worker/, 'main() on a worker');
   need(/^\[baton-test\] product imports on the main thread/, "the product's disc, storage and eggy imports answering from the main thread");
+  need(/^\[baton-test\] a wake before eggy_wait is kept/, "a wake that reaches the page before eggy_wait is kept");
   need(/^\[ios26\] aurora: window::initialize .* on the browser main thread/, 'SDL window setup on the main thread');
   need(/^\[ios26\] aurora: WebGPU instance without TimedWaitAny/, 'the WebGPU instance without TimedWaitAny');
   need(/Canvas is ready; creating the surface/, 'aurora creating the surface once the canvas was shown');
