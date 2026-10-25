@@ -26,11 +26,14 @@
 #include <emscripten/proxying.h>
 #include <emscripten/threading.h>
 #include <unistd.h>
+#include <wasi/api.h>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 #include <utility>
 
@@ -206,6 +209,64 @@ uint32_t __wrap_wgpuInstanceWaitAny(void* instance, size_t count, void* futures,
         }
         usleep(500);
     }
+}
+
+// ---- stdout and stderr ------------------------------------------------------------------------
+// Every printf of a guest thread ends in the fd_write import, which Emscripten runs on the browser
+// main thread (its file system lives there) while the worker waits: a round trip per line, queued
+// behind whatever the main thread is doing (a frame, a presentation). Console output needs no
+// answer, so a worker's writes to descriptors 1 and 2 are copied and handed to the main thread
+// without waiting, and the real fd_write prints them there exactly as before (the same TTY line
+// buffering, Module.print / printErr). The system queue keeps them in order with the calling
+// thread's other main-thread calls. Every other descriptor keeps the synchronous call.
+__wasi_errno_t __real___wasi_fd_write(__wasi_fd_t fd, const __wasi_ciovec_t* iovs, size_t count,
+                                      __wasi_size_t* written);
+
+namespace {
+struct ConsoleWrite {
+    __wasi_fd_t fd;
+    __wasi_size_t size;
+    uint8_t bytes[];
+};
+
+void ConsoleWriteOnMainThread(void* argument)
+{
+    auto* write = static_cast<ConsoleWrite*>(argument);
+    const __wasi_ciovec_t iov{write->bytes, write->size};
+    __wasi_size_t written = 0;
+    (void)__real___wasi_fd_write(write->fd, &iov, 1, &written);
+    std::free(write);
+}
+} // namespace
+
+__wasi_errno_t __wrap___wasi_fd_write(__wasi_fd_t fd, const __wasi_ciovec_t* iovs, size_t count,
+                                      __wasi_size_t* written)
+{
+    if ((fd != 1 && fd != 2) || emscripten_is_main_browser_thread()) {
+        return __real___wasi_fd_write(fd, iovs, count, written);
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        total += iovs[i].buf_len;
+    }
+    auto* write = static_cast<ConsoleWrite*>(std::malloc(sizeof(ConsoleWrite) + total));
+    if (write == nullptr) {
+        return __real___wasi_fd_write(fd, iovs, count, written);
+    }
+    write->fd = fd;
+    write->size = static_cast<__wasi_size_t>(total);
+    size_t offset = 0;
+    for (size_t i = 0; i < count; ++i) {
+        std::memcpy(write->bytes + offset, iovs[i].buf, iovs[i].buf_len);
+        offset += iovs[i].buf_len;
+    }
+    if (!emscripten_proxy_async(emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(),
+                                ConsoleWriteOnMainThread, write)) {
+        std::free(write);
+        return __real___wasi_fd_write(fd, iovs, count, written);
+    }
+    *written = static_cast<__wasi_size_t>(total);
+    return __WASI_ERRNO_SUCCESS;
 }
 
 // ---- emscripten_sleep -------------------------------------------------------------------------

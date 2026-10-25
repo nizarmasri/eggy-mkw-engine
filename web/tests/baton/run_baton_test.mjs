@@ -199,6 +199,13 @@ try {
   need(/^\[ios26\] baton: context #\d+ is running on its own worker/, 'a context running on its own worker');
   need(/^\[ios26\] baton: .* frames .* hand-offs/, 'the per-frame baton statistics');
   need(/^\[ios26\] heartbeat/, 'the main thread heartbeat');
+  need(/^\[ios26\] baton by name, per frame: JS .*\| aurora .*end_frame/, 'the per-frame breakdown by name');
+  // baton_test.cpp prints 300 lines from a worker without waiting for the main thread: all of
+  // them must still reach the console, in order.
+  const consoleLines = lines.map((l) => /^\[baton-test\] console (\d+)$/.exec(l)).filter(Boolean).map((m) => Number(m[1]));
+  if (consoleLines.length !== 300 || consoleLines.some((n, i) => n !== i)) {
+    problems.push(`a worker's console lines arrived incomplete or out of order (${consoleLines.length} of 300)`);
+  }
 
   const box = await page.evaluate(() => {
     const r = document.getElementById('canvas').getBoundingClientRect();

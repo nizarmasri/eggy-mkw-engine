@@ -28,7 +28,9 @@ set(MKW_WEB_BATON_WRAPPED_SYMBOLS
     _ZN6aurora5imgui10initializeEv
     wgpuCreateInstance
     wgpuInstanceWaitAny
-    emscripten_sleep)
+    emscripten_sleep
+    # libc's stdio writes (the fd_write import): a worker's console output does not wait.
+    __wasi_fd_write)
 
 # Fails the configure early with the reason, instead of a link error about shared memory
 # features or, worse, an SDL whose mutexes do nothing.

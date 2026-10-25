@@ -60,6 +60,8 @@ namespace {
 
 constexpr int kFrames = 150;
 constexpr int kHandOffsPerFrame = 10;
+// web/tests/baton/run_baton_test.mjs expects exactly this many "[baton-test] console N" lines.
+constexpr int kConsoleLines = 300;
 // What GXSetCopyClear paints; the page looks for it on screen.
 constexpr GXColor kClear{200, 40, 160, 255};
 
@@ -170,6 +172,20 @@ void RendererEntry(void*)
                 "storage persistent %d read-only %d, mod mount '%s'\n",
                 waitMs, persistent, readOnly, modName ? modName : "(none)");
     std::free(modName);
+
+    // A worker's console output is handed to the main thread without waiting for it (the
+    // fd_write import is wrapped in baton_main_thread.cpp): these lines cost far less than as many
+    // round trips (1-4 ms each on CI), and the page checks that they all arrived, in order.
+    const double consoleStart = emscripten_get_now();
+    for (int i = 0; i < kConsoleLines; ++i) {
+        std::printf("[baton-test] console %d\n", i);
+    }
+    const double consoleMs = emscripten_get_now() - consoleStart;
+    std::printf("[baton-test] %d console lines from a worker took %.1f ms\n", kConsoleLines, consoleMs);
+    if (consoleMs > 150.0) {
+        Fail("a worker's console output waited for the main thread (" + std::to_string(consoleMs) + " ms for " +
+             std::to_string(kConsoleLines) + " lines)");
+    }
     if (g_never) {
         uint8_t bytes[16] = {};
         int32_t block[4] = {};

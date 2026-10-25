@@ -165,6 +165,13 @@ void AbortPendingDeferredConnects(uint32_t wiiFd, int32_t result) {
 }
 
 static void NoteDeferredNetworkSchedulerThread(const char* operation) {
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+    // [Eggy] The baton build (EGGY.md, "iOS 26"): every guest context is a pthread of its own and
+    // the emulation thread is whichever holds the baton, so the host thread id changes with every
+    // guest thread switch. Every caller is guest code, i.e. the baton holder, and the hand-off
+    // orders memory like a fiber switch.
+    (void)operation;
+#else
     DeferredNetworkStore& store = GetDeferredNetworkStore();
     const std::thread::id current = std::this_thread::get_id();
     std::lock_guard<std::mutex> lock(store.schedulerThreadMutex);
@@ -180,6 +187,7 @@ static void NoteDeferredNetworkSchedulerThread(const char* operation) {
         assert(*store.schedulerThread == current);
 #endif
     }
+#endif
 }
 
 static int32_t DeferredDnsFailureResult(DeferredDnsKind kind) {
