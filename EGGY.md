@@ -187,4 +187,18 @@ prebuilt fingerprint.
   - The call is gone. Camera 0 already follows `hudPlayerIds[0]`; the park line now logs it as
     `screen: cameras N, camera 0 follows slot S`.
   - `OneHudSlot` gives the race HUD one full-screen slot.
-  - Smokes for 2 and 4 humans and the myPort 0 vs 1 hash comparison: pending.
+- **engine-6321b26** (build run 40234603031), smokes on 2026-10-25. Each one reaches its report
+  at frame 1500 with no runtime error:
+  - 40237125193, 2 humans, myPort 1: camera 0 follows slot 1 (Peach) full screen; one 1P HUD
+    (3rd, lap 1/3, her Mushroom in the item window).
+  - 40237159881, 4 humans, myPort 3: Yoshi full screen; 1P HUD 1st; the minimap highlights him.
+  - 40237168406, 1 human: unchanged. Hashes equal b9770e3's, frame for frame.
+  - 40237178581, 2 humans, myPort 0: Bowser.
+- **myPort 0 and myPort 1 run the same race.** The test page's hash at every 30th frame, 0-1500,
+  is identical in all 51 samples between the two 2-human runs, Mushroom pickup included; both end
+  on 0x61d64341.
+- **Not covered by a smoke:**
+  - sound (headless); the other humans' karts are local sound actors (above);
+  - the shell-targeting hook (no shells were thrown);
+  - team and battle sections with 2+ humans;
+  - a cross-port hash comparison with 4 humans.
