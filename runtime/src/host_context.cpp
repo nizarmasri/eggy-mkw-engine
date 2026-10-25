@@ -27,6 +27,7 @@ extern "C" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argumen
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 
 #include "platform/web_host.h"
 
@@ -35,13 +36,22 @@ extern "C" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argumen
 extern "C" void mkw_host_watch_visibility(int32_t* hidden);
 // Counts a presented frame for the page (Module.mkwFramesPresented), asynchronously.
 extern "C" void mkw_host_note_frame(void);
+// Writes the name of the proxied JS import in `slot` (WebHost::BatonImportStats) into `out`.
+extern "C" void mkw_baton_import_name(uint32_t slot, char* out, uint32_t size);
 
 namespace {
 // See WebHost::BatonCounter (platform/web_host.h).
 std::atomic<uint32_t> g_batonCounters[WebHost::kBatonCounterCount];
+WebHost::BatonCallStats g_batonImports[WebHost::kBatonImportSlots];
+WebHost::BatonCallStats g_batonMainCalls[WebHost::kBatonMainCallKinds];
+// Hand-offs by destination context id; ids past the end share the last slot.
+constexpr uint32_t kHandOffSlots = 32;
+std::atomic<uint32_t> g_handOffsTo[kHandOffSlots];
 std::atomic<uint32_t> g_liveContexts{0};
 std::atomic<uint32_t> g_parkedForGood{0};
 std::atomic<int32_t> g_pageHidden{0};
+
+static_assert(sizeof(WebHost::BatonCallStats) == 3 * sizeof(uint32_t), "read as three u32 words by JS");
 
 void AddBatonCounter(WebHost::BatonCounter counter, uint32_t value)
 {
@@ -53,6 +63,17 @@ void AddBatonCounter(WebHost::BatonCounter counter, uint32_t value)
 extern "C" EMSCRIPTEN_KEEPALIVE std::atomic<uint32_t>* mkw_baton_counters()
 {
     return g_batonCounters;
+}
+
+// For the JS side: WebHost::BatonImportStats() and WebHost::BatonMainCallStats().
+extern "C" EMSCRIPTEN_KEEPALIVE WebHost::BatonCallStats* mkw_baton_import_stats()
+{
+    return g_batonImports;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE WebHost::BatonCallStats* mkw_baton_main_call_stats()
+{
+    return g_batonMainCalls;
 }
 #elif defined(__EMSCRIPTEN__)
 #include <emscripten/emscripten.h>
@@ -348,7 +369,10 @@ Handle Create(std::size_t stackSize, Entry entry, void* argument)
         return nullptr;
     }
     const uint32_t live = g_liveContexts.fetch_add(1, std::memory_order_relaxed) + 1;
-    std::printf("[ios26] baton: created context #%u as a pthread (%u live)\n", context->id, live);
+    // The argument is the guest OSThread's address (fiber_manager.cpp), which names the context
+    // in the hand-off breakdown.
+    std::printf("[ios26] baton: created context #%u as a pthread (%u live, argument %p)\n", context->id,
+                live, argument);
     return context;
 }
 
@@ -386,6 +410,7 @@ void Switch(Handle target)
     }
 
     AddBatonCounter(WebHost::kBatonHandOffs, 1);
+    g_handOffsTo[std::min(destination->id, kHandOffSlots - 1)].fetch_add(1, std::memory_order_relaxed);
     g_current = destination;
     destination->handedAt = emscripten_get_now();
     // Drop our own word before handing over: the destination may hand the baton straight back,
@@ -636,6 +661,108 @@ std::atomic<uint32_t>* BatonCounters()
     return g_batonCounters;
 }
 
+BatonCallStats* BatonImportStats()
+{
+    return g_batonImports;
+}
+
+BatonCallStats* BatonMainCallStats()
+{
+    return g_batonMainCalls;
+}
+
+namespace {
+struct CallDelta {
+    uint32_t calls = 0;
+    uint32_t waitMicros = 0;
+    uint32_t runMicros = 0;
+};
+
+CallDelta TakeDelta(const BatonCallStats& stats, uint32_t (&last)[3])
+{
+    const uint32_t now[3] = {stats.calls.load(std::memory_order_relaxed),
+                             stats.waitMicros.load(std::memory_order_relaxed),
+                             stats.runMicros.load(std::memory_order_relaxed)};
+    const CallDelta delta{now[0] - last[0], now[1] - last[1], now[2] - last[2]};
+    std::copy(std::begin(now), std::end(now), std::begin(last));
+    return delta;
+}
+
+// Appends printf-formatted text to `line`, never past its end.
+template <size_t N, typename... Args>
+void Append(char (&line)[N], size_t& used, const char* format, Args... args)
+{
+    if (used + 1 >= N) {
+        return;
+    }
+    const int written = std::snprintf(line + used, N - used, format, args...);
+    if (written > 0) {
+        used = std::min(N - 1, used + static_cast<size_t>(written));
+    }
+}
+
+// The second stats line: what the main-thread round trips and the hand-offs of the last window
+// were, per frame and by name, the costliest first. "wait" is what the guest's worker was blocked
+// (queueing behind other main-thread work included), "run" what the main thread spent on the call.
+void PrintBreakdown(uint32_t frames)
+{
+    static uint32_t s_lastImports[kBatonImportSlots][3] = {};
+    static uint32_t s_lastMain[kBatonMainCallKinds][3] = {};
+    static uint32_t s_lastHandOffs[kHandOffSlots] = {};
+    const double perFrame = frames != 0 ? 1.0 / frames : 0.0;
+    const auto each = [](uint32_t total, uint32_t calls) { return calls != 0 ? double(total) / calls : 0.0; };
+
+    char line[2048];
+    size_t used = 0;
+    Append(line, used, "%s", "[ios26] baton by name, per frame: JS");
+    struct Entry {
+        uint32_t slot;
+        CallDelta delta;
+    };
+    Entry imports[kBatonImportSlots];
+    uint32_t importCount = 0;
+    for (uint32_t slot = 0; slot < kBatonImportSlots; ++slot) {
+        const CallDelta delta = TakeDelta(g_batonImports[slot], s_lastImports[slot]);
+        if (delta.calls != 0) {
+            imports[importCount++] = {slot, delta};
+        }
+    }
+    std::sort(imports, imports + importCount, [](const Entry& a, const Entry& b) {
+        return a.delta.waitMicros != b.delta.waitMicros ? a.delta.waitMicros > b.delta.waitMicros
+                                                        : a.delta.calls > b.delta.calls;
+    });
+    for (uint32_t i = 0; i < std::min<uint32_t>(importCount, 14); ++i) {
+        char name[64] = "?";
+        mkw_baton_import_name(imports[i].slot, name, sizeof name);
+        const CallDelta& d = imports[i].delta;
+        Append(line, used, " %s %.2f (%.0f/%.0f us)", name, d.calls * perFrame, each(d.waitMicros, d.calls),
+               each(d.runMicros, d.calls));
+    }
+    if (importCount > 14) {
+        Append(line, used, " +%u more", importCount - 14);
+    }
+    static const char* const kMainNames[kBatonMainCallKinds] = {"update", "begin_frame", "end_frame", "other"};
+    Append(line, used, "%s", " | aurora");
+    for (uint32_t kind = 0; kind < kBatonMainCallKinds; ++kind) {
+        const CallDelta d = TakeDelta(g_batonMainCalls[kind], s_lastMain[kind]);
+        if (d.calls != 0) {
+            Append(line, used, " %s %.2f (%.0f/%.0f us)", kMainNames[kind], d.calls * perFrame,
+                   each(d.waitMicros, d.calls), each(d.runMicros, d.calls));
+        }
+    }
+    Append(line, used, "%s", " | hand-offs to");
+    for (uint32_t slot = 0; slot < kHandOffSlots; ++slot) {
+        const uint32_t value = g_handOffsTo[slot].load(std::memory_order_relaxed);
+        const uint32_t delta = value - s_lastHandOffs[slot];
+        s_lastHandOffs[slot] = value;
+        if (delta != 0) {
+            Append(line, used, " #%u %.1f", slot, delta * perFrame);
+        }
+    }
+    std::printf("%s (wait/run us each)\n", line);
+}
+} // namespace
+
 bool PageHidden()
 {
     return g_pageHidden.load(std::memory_order_acquire) != 0;
@@ -697,6 +824,7 @@ void NoteFramePresented()
                     per(delta[kBatonMainCallMicros], delta[kBatonMainCalls]) / 1000.0,
                     blockedShare * 100.0, g_liveContexts.load(std::memory_order_relaxed),
                     g_parkedForGood.load(std::memory_order_relaxed));
+        PrintBreakdown(delta[kBatonFrames]);
     }
     ++s_reports;
     s_windowStart = now;

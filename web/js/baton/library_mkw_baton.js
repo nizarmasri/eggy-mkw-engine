@@ -95,14 +95,26 @@
 addToLibrary({
   // Diagnostics (runtime/src/host_context.cpp mkw_baton_counters(), WebHost::BatonCounter):
   // every JS call a worker proxies to the main thread is counted in slot 0 and the time the worker
-  // spent blocked on it (microseconds) in slot 1. The main thread prints a heartbeat of all the
+  // spent blocked on it (microseconds) in slot 1, and the same by import in
+  // WebHost::BatonImportStats (index in Emscripten's proxiedFunctionTable), where the main thread
+  // adds the time it spent running the call. The main thread prints a heartbeat of all the
   // counters, which shows whether the guest is still handing the baton around even before (or
   // without) a presented frame.
-  $MkwBaton__deps: ['$proxyToMainThread', 'mkw_baton_counters'],
+  $MkwBaton__deps: ['$proxyToMainThread', 'mkw_baton_counters', 'mkw_baton_import_stats',
+                    'mkw_baton_main_call_stats'],
   $MkwBaton__postset: 'MkwBaton.install();',
   $MkwBaton: {
     counters: 0,
+    imports: 0,
     heartbeat: 0,
+    // Import names by slot, kept on the main thread before its table entries are wrapped.
+    names: null,
+    // WebHost::kBatonImportSlots; the last slot counts MAIN_THREAD_EM_ASM code.
+    importSlots: 512,
+
+    slotOf(funcIndex, emAsmAddr) {
+      return emAsmAddr ? MkwBaton.importSlots - 1 : Math.min(funcIndex, MkwBaton.importSlots - 2);
+    },
 
     install() {
       if (!ENVIRONMENT_IS_PTHREAD) {
@@ -112,35 +124,105 @@ addToLibrary({
         return;
       }
       const proxy = proxyToMainThread;
-      proxyToMainThread = (...args) => {
-        if (!MkwBaton.counters) MkwBaton.counters = _mkw_baton_counters() >> 2;
+      proxyToMainThread = (funcIndex, emAsmAddr, proxyMode, ...callArgs) => {
+        if (!MkwBaton.counters) {
+          MkwBaton.counters = _mkw_baton_counters() >> 2;
+          MkwBaton.imports = _mkw_baton_import_stats() >> 2;
+        }
         const start = performance.now();
-        const result = proxy(...args);
+        const result = proxy(funcIndex, emAsmAddr, proxyMode, ...callArgs);
+        const micros = Math.round((performance.now() - start) * 1000) >>> 0;
+        const slot = MkwBaton.imports + 3 * MkwBaton.slotOf(funcIndex, emAsmAddr);
         Atomics.add(HEAPU32, MkwBaton.counters, 1);
-        Atomics.add(HEAPU32, MkwBaton.counters + 1, Math.round((performance.now() - start) * 1000) >>> 0);
+        Atomics.add(HEAPU32, MkwBaton.counters + 1, micros);
+        Atomics.add(HEAPU32, slot, 1);
+        Atomics.add(HEAPU32, slot + 1, micros);
         return result;
       };
+    },
+
+    // On the main thread: each proxied function adds the time it ran (until its promise settled,
+    // for a promise import) to its import's third word. Only the table the proxying reads is
+    // wrapped; the wasm imports stay the functions themselves.
+    timeProxiedCalls() {
+      if (typeof proxiedFunctionTable == 'undefined' || MkwBaton.names) return;
+      const base = _mkw_baton_import_stats() >> 2;
+      MkwBaton.names = proxiedFunctionTable.map((fn) => fn?.name ?? '');
+      proxiedFunctionTable.forEach((fn, index) => {
+        if (typeof fn != 'function') return;
+        const word = base + 3 * MkwBaton.slotOf(index, 0) + 2;
+        proxiedFunctionTable[index] = function (...args) {
+          const start = performance.now();
+          const done = () => { Atomics.add(HEAPU32, word, Math.round((performance.now() - start) * 1000) >>> 0); };
+          const result = fn.apply(this, args);
+          if (result && typeof result.then == 'function') result.then(done, done);
+          else done();
+          return result;
+        };
+      });
+    },
+
+    // Sum of one word (0 calls, 1 wait, 2 run) over `count` call-stats entries at `base` (words).
+    sumStats(base, count, word) {
+      let total = 0;
+      for (let i = 0; i < count; ++i) total += Atomics.load(HEAPU32, base + 3 * i + word);
+      return total >>> 0;
     },
 
     startHeartbeat() {
       if (MkwBaton.heartbeat) return;
       const base = _mkw_baton_counters() >> 2;
-      const read = () => Array.from({ length: 7 }, (_, i) => Atomics.load(HEAPU32, base + i));
+      const imports = _mkw_baton_import_stats() >> 2;
+      const mainCalls = _mkw_baton_main_call_stats() >> 2;
+      // The counters, then the main thread's own time on proxied JS and on aurora's entry points.
+      const read = () => [
+        ...Array.from({ length: 7 }, (_, i) => Atomics.load(HEAPU32, base + i)),
+        MkwBaton.sumStats(imports, MkwBaton.importSlots, 2),
+        MkwBaton.sumStats(mainCalls, 4, 2),
+      ];
       const start = performance.now();
       let last = read();
       let beats = 0;
+      // How late a 20 ms timer fires: the longest the main thread was busy in one go.
+      let stall = 0;
+      let due = performance.now() + 20;
+      const probe = () => {
+        const now = performance.now();
+        if (globalThis.document?.visibilityState !== 'hidden') stall = Math.max(stall, now - due);
+        due = now + 20;
+        setTimeout(probe, 20);
+      };
+      setTimeout(probe, 20);
       MkwBaton.heartbeat = setInterval(() => {
         const now = read();
         const d = now.map((v, i) => (v - last[i]) >>> 0);
         last = now;
+        const worst = stall;
+        stall = 0;
         ++beats;
         // Every 5 s for the first minute, then every 30 s.
         if (beats > 12 && beats % 6) return;
         out(`[ios26] heartbeat ${((performance.now() - start) / 1000).toFixed(0)} s (last 5 s): ` +
             `${d[2]} hand-offs, ${d[0]} JS calls on the main thread, ${d[5]} aurora calls on the main ` +
-            `thread, ${d[4]} frames; totals ${now[2]} hand-offs, ${now[4]} frames`);
+            `thread, ${d[4]} frames; totals ${now[2]} hand-offs, ${now[4]} frames; main thread ran ` +
+            `proxied JS ${(d[7] / 1000).toFixed(0)} ms and aurora ${(d[8] / 1000).toFixed(0)} ms, ` +
+            `longest stall ${worst.toFixed(0)} ms`);
       }, 5000);
     },
+  },
+
+  // The name of the proxied JS import counted in `slot` of WebHost::BatonImportStats, for the
+  // per-frame breakdown host_context.cpp prints. Runs on the calling worker (its own copy of the
+  // table has the same order).
+  mkw_baton_import_name__deps: ['$MkwBaton', '$stringToUTF8'],
+  mkw_baton_import_name: (slot, outPtr, size) => {
+    let name = '';
+    if (slot == MkwBaton.importSlots - 1) {
+      name = 'MAIN_THREAD_EM_ASM';
+    } else if (typeof proxiedFunctionTable != 'undefined') {
+      name = MkwBaton.names?.[slot] || proxiedFunctionTable[slot]?.name || '';
+    }
+    stringToUTF8(name.replace(/^_+/, '') || `#${slot}`, outPtr, size);
   },
 
   // Keeps the 32-bit word at `hidden` equal to (document.visibilityState == 'hidden') and wakes
@@ -162,6 +244,7 @@ addToLibrary({
     };
     update();
     if (typeof document != 'undefined') document.addEventListener('visibilitychange', update);
+    MkwBaton.timeProxiedCalls();
     MkwBaton.startHeartbeat();
   },
 });

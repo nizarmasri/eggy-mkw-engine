@@ -66,6 +66,28 @@ enum BatonCounter : uint32_t {
     kBatonCounterCount = 8,
 };
 std::atomic<uint32_t>* BatonCounters();
+
+// The same costs by name, for the per-frame breakdown the stats line is followed by. Each entry is
+// three u32 words: calls, microseconds the calling worker was blocked, microseconds the browser
+// main thread spent running the call (until its promise settled, for a promise import).
+struct BatonCallStats {
+    std::atomic<uint32_t> calls{0};
+    std::atomic<uint32_t> waitMicros{0};
+    std::atomic<uint32_t> runMicros{0};
+};
+// Proxied JS imports, by their index in Emscripten's proxiedFunctionTable; the last slot counts
+// MAIN_THREAD_EM_ASM code. Bumped by web/js/baton/library_mkw_baton.js.
+constexpr uint32_t kBatonImportSlots = 512;
+BatonCallStats* BatonImportStats();
+// aurora's entry points run on the browser main thread (runtime/src/platform/web/baton_main_thread.cpp).
+enum BatonMainCall : uint32_t {
+    kMainCallUpdate = 0,
+    kMainCallBeginFrame = 1,
+    kMainCallEndFrame = 2,
+    kMainCallOther = 3,
+    kBatonMainCallKinds = 4,
+};
+BatonCallStats* BatonMainCallStats();
 #elif defined(__EMSCRIPTEN__)
 // A single macrotask hop: the browser renders, delivers input and settles
 // promises, then this stack resumes (no setTimeout clamp).

@@ -46,8 +46,9 @@ std::atomic<uint32_t>& Counter(WebHost::BatonCounter counter)
 }
 
 // Runs fn() on the browser main thread and returns its result; a plain call when already there.
+// `kind` names it in the per-frame breakdown (WebHost::BatonMainCallStats).
 template <typename F>
-auto OnMainThread(F&& fn) -> std::invoke_result_t<F&>
+auto OnMainThread(WebHost::BatonMainCall kind, F&& fn) -> std::invoke_result_t<F&>
 {
     using Result = std::invoke_result_t<F&>;
     if (emscripten_is_main_browser_thread()) {
@@ -56,25 +57,32 @@ auto OnMainThread(F&& fn) -> std::invoke_result_t<F&>
     struct Call {
         std::remove_reference_t<F>* fn;
         std::conditional_t<std::is_void_v<Result>, char, Result> result{};
+        double runMs = 0.0;
     } call{&fn};
     const double start = emscripten_get_now();
     const int ok = emscripten_proxy_sync(
         emscripten_proxy_get_system_queue(), emscripten_main_runtime_thread_id(),
         [](void* argument) {
             auto* c = static_cast<Call*>(argument);
+            const double runStart = emscripten_get_now();
             if constexpr (std::is_void_v<Result>) {
                 (*c->fn)();
             } else {
                 c->result = (*c->fn)();
             }
+            c->runMs = emscripten_get_now() - runStart;
         },
         &call);
     if (!ok) {
         std::fprintf(stderr, "[ios26] baton: could not run a call on the browser main thread\n");
     }
+    const auto waitMicros = static_cast<uint32_t>((emscripten_get_now() - start) * 1000.0);
     Counter(WebHost::kBatonMainCalls).fetch_add(1, std::memory_order_relaxed);
-    Counter(WebHost::kBatonMainCallMicros)
-        .fetch_add(static_cast<uint32_t>((emscripten_get_now() - start) * 1000.0), std::memory_order_relaxed);
+    Counter(WebHost::kBatonMainCallMicros).fetch_add(waitMicros, std::memory_order_relaxed);
+    WebHost::BatonCallStats& stats = WebHost::BatonMainCallStats()[kind];
+    stats.calls.fetch_add(1, std::memory_order_relaxed);
+    stats.waitMicros.fetch_add(waitMicros, std::memory_order_relaxed);
+    stats.runMicros.fetch_add(static_cast<uint32_t>(call.runMs * 1000.0), std::memory_order_relaxed);
     if constexpr (!std::is_void_v<Result>) {
         return call.result;
     }
@@ -85,7 +93,7 @@ template <typename F>
 auto OnMainThreadNoted(const char* what, F&& fn) -> std::invoke_result_t<F&>
 {
     std::printf("[ios26] aurora: %s on the browser main thread\n", what);
-    return OnMainThread(std::forward<F>(fn));
+    return OnMainThread(WebHost::kMainCallOther, std::forward<F>(fn));
 }
 
 constexpr uint32_t kWaitStatusTimedOut = 2; // WGPUWaitStatus_TimedOut (webgpu/webgpu.h)
@@ -103,17 +111,17 @@ void __real_aurora_set_display_mode(AuroraDisplayMode mode);
 
 bool __wrap_aurora_begin_frame()
 {
-    return OnMainThread([] { return __real_aurora_begin_frame(); });
+    return OnMainThread(WebHost::kMainCallBeginFrame, [] { return __real_aurora_begin_frame(); });
 }
 
 void __wrap_aurora_end_frame()
 {
-    OnMainThread([] { __real_aurora_end_frame(); });
+    OnMainThread(WebHost::kMainCallEndFrame, [] { __real_aurora_end_frame(); });
 }
 
 const AuroraEvent* __wrap_aurora_update()
 {
-    return OnMainThread([] { return __real_aurora_update(); });
+    return OnMainThread(WebHost::kMainCallUpdate, [] { return __real_aurora_update(); });
 }
 
 void __wrap_aurora_shutdown()
@@ -123,7 +131,7 @@ void __wrap_aurora_shutdown()
 
 void __wrap_aurora_set_display_mode(AuroraDisplayMode mode)
 {
-    OnMainThread([mode] { __real_aurora_set_display_mode(mode); });
+    OnMainThread(WebHost::kMainCallOther, [mode] { __real_aurora_set_display_mode(mode); });
 }
 
 // ---- SDL window steps inside aurora::initialize (aurora-main/lib/window.hpp, imgui.hpp) -------
