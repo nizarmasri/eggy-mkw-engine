@@ -31,9 +31,10 @@ repository from a pinned commit of this one.
 - `.github/workflows/eggy.yml`: the web disc test on every push (Node, JSPI, no game data).
 - `runtime/src/eggy/eggy.cpp`, `runtime/include/eggy/eggy.h`, `web/js/library_eggy.js`,
   `web/site/eggy.html`, `web/site/eggy/eggy-engine.js`, `web/site/eggy/eggy-test.js`: Eggy's
-  host API (below). Hooks on 0x80009984, 0x80009988, 0x805302C4 and 0x8051AF84 are
-  `REGISTER_NATIVE_FUNCTION_AS` natives that call the translated bodies; without `Module.eggy`
-  they fall straight through.
+  host API (below). Hooks on 0x80009984, 0x80009988, 0x805302C4 and 0x8051AF84, and on the
+  five `Pages::RaceHUD` functions 0x80856278, 0x80856CEC, 0x808574B8, 0x80858A50 and 0x80858AE4,
+  are `REGISTER_NATIVE_FUNCTION_AS` natives that call the translated bodies; without
+  `Module.eggy` they fall straight through.
 - The baton build (below): `runtime/cmake/WebBaton.cmake`,
   `runtime/src/platform/web/baton_main_thread.cpp`, `web/js/baton/library_mkw_baton.js`, the
   test `web/tests/baton/` and `.github/workflows/ios26.yml` (runs it on every push to `ios26`).
@@ -127,8 +128,49 @@ prebuilt fingerprint.
   same two writes make `away` CPU-driven.
 - Force60: `GameScene::setFramerate(this, is30)` 0x8051AF84 (called from
   `RaceScene_createSubsystems`); force r4 = 0.
-- Camera: `ChangeFocusedPlayer(playerId)` 0x805A9B04 (CameraManager
-  0x809C19B8, focused +0x27).
+- Camera: `RaceCameraMgr` 0x809C19B8: +0x14 cameras, +0x18 sortedCameras, +0x1C cameraCount
+  (= screen count 0x808B4BF0, from race scenario +5), +0x25 live view (camera mode 6), +0x27
+  focused player (live view only; the ctor sets 0). Outside live view the ctor builds camera i for
+  `Racedata::GetPlayerIdOfLocalPlayer(i)` 0x80531F70, which is `hudPlayerIds[i]`; RaceCamera +0x9C
+  is its player. In live view it builds one camera per player, indexed by player id.
+  `RaceCameraMgr::ChangeFocusedPlayer` 0x805A9B04 assumes that layout (`cameras[playerIdx]`), and
+  its only caller is `RaceHUD::BeforeControlUpdate`, in the live-view sections 0x6A-0x6B and
+  0x6E-0x6F. Calling it with one screen and player 1 reads `cameras[1]` past the array: this was
+  b9770e3's crash (guest store to 0x55440340 = garbage + 0x33E, `isFocused`).
+- One screen, many local players (b9770e3's `PatchOneScreen`). Each scenario field has its own
+  readers:
+  - **Screen count (+5, +7):** sizes the cameras, the audio listeners (`Audio::RaceMgr` ctor
+    0x80710688: listener count = +5, all of them `hudPlayerIds[k]`), the Lakitus
+    (`Lakitu::Manager::CreatePlayers` 0x8071E480) and per-screen effects and object LOD. All of
+    them follow `hudPlayerIds[0]` with no help.
+  - **localPlayerCount (+6):** must stay the number of REAL_LOCAL players.
+    - `AI::Manager::GetLocalPlayerCount` 0x80739530 bounds the real-player controllers the CPUs
+      consider; `AddKartAIController` 0x8073922C fills that list by type, in slot order.
+    - Course objects size per-local-kart buffers by +6. 0x80753B34 has capacity = +6 and writes
+      one entry per `Kart::Link::IsLocal` kart, so +6 = 1 with two REAL_LOCAL karts overruns it.
+    - 0x806DF680 measures distances to karts in slots 0..+6-1.
+  - **`Pages::RaceHUD` uses +6, not the screen count.** It sizes its slots (`OnInit` →
+    `GetCtrlRaceBaseCount` / `InitCtrlRaceBase`, layout names `CtrlRaceRankNum_<count>_<slot>`)
+    and loops over them every frame. The functions that read it:
+    - `OnInit` 0x80856278 (and `InitActions`);
+    - `BeforeControlUpdate` 0x80856CEC;
+    - `AfterControlUpdate` 0x808574B8;
+    - `OnItemObjTargeting` 0x80858A50, called from red and blue shells;
+    - `UpdateRaceBalloons` 0x80858AE4, called from `RaceCameraMgr::Update`.
+
+    The other readers of +6 are pause, results and leaderboard pages. Eggy shows the 1P HUD of
+    slot 0 by making +6 read 1 only while those five run (`OneHudSlot` in eggy.cpp).
+  - **Local numbers (player +5) and `hudPlayerIds`:** no reader changes race state. Kart local
+    status (`Kart::Status` ctor sets bitfield4 bit 2 from type 0) goes by player type, and so do
+    race end (`GMDataVS::CanRaceEnd` 0x80536054 counts unfinished type-0 players; it reads
+    `hudPlayerIds[0]` only in competition mode), items (`DriverMgr::IsPlayerComputer` 0x807BD5BC
+    is 1 for type 0 whatever the slot; `Item::Player` uses the slot only for local warning sounds)
+    and the AI list. Everything else that calls `GetHudSlotId` 0x80531F18 (24 callers) or
+    `GetPlayerIdOfLocalPlayer` (53) is camera, HUD, sound, effects, Lakitu or kart models (the
+    models only with 2+ screens). Race RNG (`Raceinfo` +4/+8) is drawn by item code only.
+  - **Sound:** kart and character actors (`Audio::KartActor::Link` 0x80707534) treat a kart with a
+    local number as local, so the other humans' karts sound like local karts (lap jingles, sound
+    limits), but the 3D listener is this phone's camera.
 - Kart: KartObjectManager 0x809C18F8 +0x20 objects; object +0 -> pointers
   (+0 values (+0 isBike), +4 status (+4/+8/+0xC/+0x10/+0x14 bitfields,
   +0x9C start-boost charge, +0xA6 trickable timer), +8 body (+0x90 physics
@@ -140,17 +182,35 @@ prebuilt fingerprint.
 
 ### Status
 
-- 9cd5ff9 compiles: data-repo build run 39340035137, build job green (translator
-  and emscripten clean). Its publish job was refused by GitHub billing, so there is
-  no `engine-9cd5ff9` release yet; `gh run rerun 39340035137 --failed` publishes it
-  without rebuilding once Actions runs again.
-- Not yet smoke-tested. First smoke: `/eggy.html` with `click=''` (steps 1-3), then
-  `/eggy.html?humans=2&myPort=1` (step 4). The console carries `[eggy]` lines for
-  every state change, the load, the race scenario after initRace and at park,
-  progress every 120 ticks while booting/loading, and every 120 race frames.
-- Step 4's one-screen patch copies the shape the game gives its own VS intro
-  (`Scenario::initRace` 0x8052FB90 with camera mode 5): screen count 1 while every
-  local player keeps a local number and a hudPlayerIds entry.
+- **engine-9cd5ff9** (smoke run 39378559830), one human:
+  - boots to idle, loads config v1, parks on frame 0 and goes;
+  - the 240-frame countdown runs and the pads drive the kart;
+  - the 1P HUD is full screen.
+- **engine-b9770e3** (the one-screen patch), one human: reaches its report (run 40228689077).
+  Its per-30-frame hashes equal 9cd5ff9's for the same config and seed, frame for frame
+  (0-1500), so a race replays exactly from its config.
+- **engine-b9770e3**, 2 humans with myPort 1: crashed at park (run 40213345378). `OnParked` read
+  RaceCameraMgr +0x27 (always 0 outside live view) as "the followed player" and called
+  `ChangeFocusedPlayer(1)`, which reads `cameras[1]` past the one-camera array.
+- **The fix:**
+  - The call is gone. Camera 0 already follows `hudPlayerIds[0]`; the park line now logs it as
+    `screen: cameras N, camera 0 follows slot S`.
+  - `OneHudSlot` gives the race HUD one full-screen slot.
+- **engine-6321b26** (build run 40234603031), smokes on 2026-10-25. Each one reaches its report
+  at frame 1500 with no runtime error:
+  - 40237125193, 2 humans, myPort 1: camera 0 follows slot 1 (Peach) full screen; one 1P HUD
+    (3rd, lap 1/3, her Mushroom in the item window).
+  - 40237159881, 4 humans, myPort 3: Yoshi full screen; 1P HUD 1st; the minimap highlights him.
+  - 40237168406, 1 human: unchanged. Hashes equal b9770e3's, frame for frame.
+  - 40237178581, 2 humans, myPort 0: Bowser.
+- **myPort 0 and myPort 1 run the same race.** The test page's hash at every 30th frame, 0-1500,
+  is identical in all 51 samples between the two 2-human runs, Mushroom pickup included; both end
+  on 0x61d64341.
+- **Not covered by a smoke:**
+  - sound (headless); the other humans' karts are local sound actors (above);
+  - the shell-targeting hook (no shells were thrown);
+  - team and battle sections with 2+ humans;
+  - a cross-port hash comparison with 4 humans.
 
 ## iOS 26: the baton build (2026-10-20)
 
