@@ -11,9 +11,20 @@
 //   finishAll=-1 frame at whose end everyone still racing is finished by place
 //   away=        "port:frame" hands that port to the computer from frame+1
 //   auto=1       go as soon as the race is parked
+//   nojspi       take JSPI away from the page first, as Safari 26 has none: the baton build runs
 (function () {
   'use strict';
   const params = new URLSearchParams(location.search);
+  if (params.has('nojspi') && typeof WebAssembly === 'object') {
+    for (const name of ['Suspending', 'promising']) {
+      try { delete WebAssembly[name]; } catch (_) { /* not configurable */ }
+      if (typeof WebAssembly[name] !== 'undefined') {
+        try { Object.defineProperty(WebAssembly, name, { value: undefined, configurable: true, writable: true }); } catch (_) { /* frozen */ }
+      }
+    }
+    console.log('[ios26] ?nojspi: removed WebAssembly.Suspending and WebAssembly.promising before the glue loads ' +
+      '(now ' + typeof WebAssembly.Suspending + ' / ' + typeof WebAssembly.promising + ')');
+  }
   const num = (name, fallback) => {
     const v = params.get(name);
     if (v === null || v === '') return fallback;

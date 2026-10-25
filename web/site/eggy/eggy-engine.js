@@ -5,6 +5,7 @@
 //   const engine = createEggyEngine({
 //     canvas,                      // the canvas the game draws into (required)
 //     base: './',                  // where WiiCompiled.js, its wasm and products.json are served
+//                                  // (without JSPI: the products.json entry with "threads":"baton")
 //     module: {},                  // extra Module fields (mkwDiscSource, mkwDiscManifestUrl, print...)
 //     preload: async (keys, onProgress) => {},   // optional: the app's own pack preloading
 //   });
@@ -22,9 +23,22 @@
 
   const STATE_MAP = { off: 'booting', booting: 'booting', idle: 'ready', loading: 'loading', parked: 'parked', racing: 'racing', finished: 'finished', failed: 'failed' };
 
+  function hasJspi() {
+    return typeof WebAssembly !== 'undefined' && typeof WebAssembly.Suspending === 'function';
+  }
+
+  // iOS 26 (Safari without JSPI): a cross-origin isolated page runs the "baton" build instead, whose
+  // guest threads are workers (products.json "threads":"baton"; the engine's EGGY.md, "iOS 26").
+  function batonPossible() {
+    return typeof WebAssembly !== 'undefined' && root.crossOriginIsolated === true &&
+      typeof SharedArrayBuffer === 'function' && typeof Atomics === 'object';
+  }
+
   function whyNot() {
     if (!root.navigator || !root.navigator.gpu) return 'This browser has no WebGPU.';
-    if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Suspending !== 'function') return 'This browser has no WebAssembly JSPI.';
+    if (!hasJspi() && !batonPossible()) {
+      return 'This browser has no WebAssembly JSPI, and the page is not cross-origin isolated for the threaded build.';
+    }
     return null;
   }
 
@@ -106,25 +120,42 @@
       });
     }
 
+    // The JSPI product where JSPI exists; without it the baton one (iOS 26), if the site has it.
+    function pickProduct(products) {
+      const list = Array.isArray(products) ? products.filter((p) => p && p.id === 'WiiCompiled') : [];
+      const baton = list.find((p) => p.threads === 'baton' && typeof p.glue === 'string' && /^[\w.-]+\.js$/.test(p.glue));
+      if (baton && batonPossible() && (!hasJspi() || !list.some((p) => p.threads !== 'baton'))) return baton;
+      return Array.isArray(products) ? products.find((p) => p && p.id === 'WiiCompiled') || products[0] : null;
+    }
+
     async function loadGlue() {
       let wasmName = null;
+      let glue = 'WiiCompiled.js';
       try {
         const products = await (await fetch(base + 'products.json', { cache: 'no-cache' })).json();
-        const product = Array.isArray(products) ? products.find((p) => p && p.id === 'WiiCompiled') || products[0] : null;
+        const product = pickProduct(products);
         if (product && typeof product.wasm === 'string') wasmName = product.wasm;
+        if (product && product.threads === 'baton') {
+          glue = product.glue;
+          log('running the baton build ' + glue + ' (no JSPI: guest threads on workers)');
+        }
       } catch (e) {
         log('no products.json, using WiiCompiled.wasm');
       }
+      if (!hasJspi() && glue === 'WiiCompiled.js') {
+        throw new Error('This browser has no WebAssembly JSPI, and this site has no build without it.');
+      }
+      const wasmFile = glue.replace(/\.js$/, '.wasm');
       const userLocate = Module.locateFile;
       Module.locateFile = (path, prefix) => {
-        if (path === 'WiiCompiled.wasm' && wasmName) return base + wasmName;
+        if (path === wasmFile && wasmName) return base + wasmName;
         if (userLocate) return userLocate(path, prefix);
         return base + path;
       };
       root.Module = Module;
       await new Promise((resolve, reject) => {
         const s = document.createElement('script');
-        s.src = base + 'WiiCompiled.js';
+        s.src = base + glue;
         s.async = true;
         s.onload = resolve;
         s.onerror = () => reject(new Error('Could not load ' + s.src));

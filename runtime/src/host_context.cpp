@@ -704,7 +704,9 @@ void Append(char (&line)[N], size_t& used, const char* format, Args... args)
 // The second stats line: what the main-thread round trips and the hand-offs of the last window
 // were, per frame and by name, the costliest first. "wait" is what the guest's worker was blocked
 // (queueing behind other main-thread work included), "run" what the main thread spent on the call.
-void PrintBreakdown(uint32_t frames)
+// Called for every window so the deltas always cover the window `frames` counts; prints only when
+// `print` (the stats line's own cadence).
+void PrintBreakdown(uint32_t frames, bool print)
 {
     static uint32_t s_lastImports[kBatonImportSlots][3] = {};
     static uint32_t s_lastMain[kBatonMainCallKinds][3] = {};
@@ -727,6 +729,19 @@ void PrintBreakdown(uint32_t frames)
             imports[importCount++] = {slot, delta};
         }
     }
+    CallDelta mainCalls[kBatonMainCallKinds];
+    for (uint32_t kind = 0; kind < kBatonMainCallKinds; ++kind) {
+        mainCalls[kind] = TakeDelta(g_batonMainCalls[kind], s_lastMain[kind]);
+    }
+    uint32_t handOffs[kHandOffSlots];
+    for (uint32_t slot = 0; slot < kHandOffSlots; ++slot) {
+        const uint32_t value = g_handOffsTo[slot].load(std::memory_order_relaxed);
+        handOffs[slot] = value - s_lastHandOffs[slot];
+        s_lastHandOffs[slot] = value;
+    }
+    if (!print) {
+        return;
+    }
     std::sort(imports, imports + importCount, [](const Entry& a, const Entry& b) {
         return a.delta.waitMicros != b.delta.waitMicros ? a.delta.waitMicros > b.delta.waitMicros
                                                         : a.delta.calls > b.delta.calls;
@@ -744,7 +759,7 @@ void PrintBreakdown(uint32_t frames)
     static const char* const kMainNames[kBatonMainCallKinds] = {"update", "begin_frame", "end_frame", "other"};
     Append(line, used, "%s", " | aurora");
     for (uint32_t kind = 0; kind < kBatonMainCallKinds; ++kind) {
-        const CallDelta d = TakeDelta(g_batonMainCalls[kind], s_lastMain[kind]);
+        const CallDelta& d = mainCalls[kind];
         if (d.calls != 0) {
             Append(line, used, " %s %.2f (%.0f/%.0f us)", kMainNames[kind], d.calls * perFrame,
                    each(d.waitMicros, d.calls), each(d.runMicros, d.calls));
@@ -752,11 +767,8 @@ void PrintBreakdown(uint32_t frames)
     }
     Append(line, used, "%s", " | hand-offs to");
     for (uint32_t slot = 0; slot < kHandOffSlots; ++slot) {
-        const uint32_t value = g_handOffsTo[slot].load(std::memory_order_relaxed);
-        const uint32_t delta = value - s_lastHandOffs[slot];
-        s_lastHandOffs[slot] = value;
-        if (delta != 0) {
-            Append(line, used, " #%u %.1f", slot, delta * perFrame);
+        if (handOffs[slot] != 0) {
+            Append(line, used, " #%u %.1f", slot, handOffs[slot] * perFrame);
         }
     }
     std::printf("%s (wait/run us each)\n", line);
@@ -808,7 +820,8 @@ void NoteFramePresented()
     const auto per = [](uint32_t total, uint32_t count) {
         return count != 0 ? static_cast<double>(total) / static_cast<double>(count) : 0.0;
     };
-    if (s_reports < 40 || (s_reports % 20) == 0) {
+    const bool print = s_reports < 40 || (s_reports % 20) == 0;
+    if (print) {
         const double blockedShare = (static_cast<double>(delta[kBatonJsCallMicros]) +
                                      static_cast<double>(delta[kBatonMainCallMicros])) / (seconds * 1e6);
         std::printf("[ios26] baton: %.1f s: %u frames (%.1f/s) | %u hand-offs (%.1f/frame, %.0f us to "
@@ -824,8 +837,8 @@ void NoteFramePresented()
                     per(delta[kBatonMainCallMicros], delta[kBatonMainCalls]) / 1000.0,
                     blockedShare * 100.0, g_liveContexts.load(std::memory_order_relaxed),
                     g_parkedForGood.load(std::memory_order_relaxed));
-        PrintBreakdown(delta[kBatonFrames]);
     }
+    PrintBreakdown(delta[kBatonFrames], print);
     ++s_reports;
     s_windowStart = now;
 }
