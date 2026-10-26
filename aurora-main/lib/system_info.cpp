@@ -260,41 +260,56 @@ void LogMisc() {
 }
 #elif defined(__EMSCRIPTEN__)
 
-// Browser: everything comes from `navigator`, read through emscripten_run_script_* (no extra
-// runtime methods needed; the returned string lives in a shared buffer, so copy it at once).
-static std::string runScriptString(const char* script) {
-  const char* text = emscripten_run_script_string(script);
-  return text != nullptr ? std::string(text) : std::string();
+// Browser: everything comes from `navigator`, read by small JS functions compiled into the glue
+// (EM_JS). Not emscripten_run_script_*: those eval their text, which a page whose CSP has no
+// 'unsafe-eval' refuses (Eggy's), and the refusal ended the engine at "Aurora initializing". They
+// run on the calling thread, and a worker has `navigator` too (the iOS 26 baton build).
+EM_JS_DEPS(aurora_system_info, "$stringToNewUTF8");
+
+EM_JS(char*, aurora_cpu_summary, (), {
+  var n = navigator.hardwareConcurrency | 0;
+  return stringToNewUTF8(n > 0 ? n + " logical processor(s) (navigator.hardwareConcurrency)" : "");
+});
+
+// Not available everywhere; Chrome rounds to a power of two and caps at 8.
+EM_JS(int, aurora_memory_mib, (), {
+  return typeof navigator.deviceMemory === "number" ? Math.round(navigator.deviceMemory * 1024) : 0;
+});
+
+EM_JS(char*, aurora_os_summary, (), {
+  var text = "";
+  var d = navigator.userAgentData;
+  if (d) {
+    if (d.platform) text = d.platform;
+    if (d.brands && d.brands.length) {
+      /* Skip the GREASE entry ("Not A;Brand") browsers add on purpose. */
+      var b = d.brands.filter(function(x) { return !/not.?a.?brand/i.test(x.brand); })
+                      .map(function(x) { return x.brand + " " + x.version; });
+      if (b.length) text += (text ? ", " : "") + b.join(", ");
+    }
+  }
+  return stringToNewUTF8(text || navigator.userAgent || "");
+});
+
+static std::string takeString(char* text) {
+  std::string out = text != nullptr ? std::string(text) : std::string();
+  std::free(text);
+  return out;
 }
 
 std::string GetCpuModel() {
   // The browser does not expose a CPU model; report what it does expose.
-  auto summary = runScriptString(
-    R"JS((function(){var n=navigator.hardwareConcurrency|0;return n>0?n+' logical processor(s) (navigator.hardwareConcurrency)':'';})())JS");
+  auto summary = takeString(aurora_cpu_summary());
   return summary.empty() ? Unknown : summary;
 }
 
 uint64_t GetMemoryAmount() {
-  // Not available everywhere; Chrome rounds to a power of two and caps at 8.
-  const int mib = emscripten_run_script_int(
-    R"JS(typeof navigator.deviceMemory==='number'?Math.round(navigator.deviceMemory*1024):0)JS");
+  const int mib = aurora_memory_mib();
   return static_cast<uint64_t>(mib) * 1024u * 1024u;
 }
 
 std::string GetOSVersion() {
-  auto summary = runScriptString(R"JS((function(){
-    var text='';var d=navigator.userAgentData;
-    if(d){
-      if(d.platform)text=d.platform;
-      if(d.brands&&d.brands.length){
-        // Skip the GREASE entry ("Not A;Brand") browsers add on purpose.
-        var b=d.brands.filter(function(x){return !/not.?a.?brand/i.test(x.brand);})
-                      .map(function(x){return x.brand+' '+x.version;});
-        if(b.length)text+=(text?', ':'')+b.join(', ');
-      }
-    }
-    return text||navigator.userAgent||'';
-  })())JS");
+  auto summary = takeString(aurora_os_summary());
   return summary.empty() ? Unknown : summary;
 }
 
