@@ -31,8 +31,42 @@ void Initialize() noexcept;
 bool OverridePads(PADStatus* statuses, uint32_t count) noexcept;
 
 // AsyncDisplay::endRender (hle/gx/gx_egg.cpp): true on a race frame whose draw Eggy skipped
-// (the renderSkip mailbox), so its EFB copy is skipped too and the screen keeps the last frame.
+// (the renderSkip mailbox, or drawEvery), so its EFB copy is skipped too and the screen keeps the
+// last frame.
 bool SkipEndRender() noexcept;
+
+// The per-frame breakdown Module.eggy.perf() reads (web/js/library_eggy.js): where a race's wall
+// time goes, in parts, each counted once (a part timed inside another is taken out of the outer
+// one). Only counted in Eggy mode while a race or its results run; free otherwise.
+namespace Perf {
+enum Part : int {
+    kCalc = 0,    // the game's logic (SceneManager::calc)
+    kDraw = 1,    // the game's own drawing code (SceneManager::draw: GX commands)
+    kSubmit = 2,  // aurora: ending, submitting and beginning a frame (WebGPU encode and submit)
+    kPresent = 3, // waiting for the frame's 60 Hz boundary once it was ready early
+    kAudio = 4,   // the audio mixer (DSP DMA blocks)
+    kPads = 5,    // waiting for the lockstep's pads of a frame
+    kYield = 6,   // the browser's turn between frames
+    kIdle = 7,    // the guest idle with nothing to run (sleeping to the next retrace)
+    kParts = 8,
+};
+// Starts timing `part`; stop it with the token this returns. Nesting is fine (the inner part's
+// time is taken out of the outer one). A timer left open across a guest stack switch is closed
+// with whatever is stopped after it.
+int Start(Part part) noexcept;
+void Stop(int token) noexcept;
+
+class Scope {
+public:
+    explicit Scope(Part part) noexcept : token_(Start(part)) {}
+    ~Scope() { Stop(token_); }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    int token_;
+};
+} // namespace Perf
 
 } // namespace Eggy
 

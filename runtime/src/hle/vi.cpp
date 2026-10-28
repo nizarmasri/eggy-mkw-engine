@@ -522,6 +522,7 @@ void VI_HLE_WaitForNextRetracePoll() {
     // deadline is farther away. The high-resolution wait removes the 1 ms
     // scheduler overshoot when retrace is the next event.
     const bool retraceIsNext = retraceDeadline <= now + 1ms;
+    const Eggy::Perf::Scope idle(Eggy::Perf::kIdle); // [eggy]
     SleepPreciselyUntil(retraceIsNext ? retraceDeadline : now + 1ms, retraceIsNext,
                         kFinalSpinWindow);
 }
@@ -635,6 +636,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     // ending the never-begun frame used to unmap and rotate a staging buffer this frame never
     // mapped. Skip the seal and keep the pacing.
     if (g_auroraFrameActive.load(std::memory_order_acquire)) {
+        const Eggy::Perf::Scope submit(Eggy::Perf::kSubmit); // [eggy]
         aurora_end_frame();
         WebHost::NoteFramePresented();
     } else {
@@ -646,12 +648,16 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     }
     // Browser build: give the page a turn every frame so the canvas presents and input arrives
     // even when the frame ran late and pacing below has nothing left to wait for. No-op natively.
-    WebHost::Yield();
+    {
+        const Eggy::Perf::Scope yield(Eggy::Perf::kYield); // [eggy]
+        WebHost::Yield();
+    }
     // Browser build: a hidden page parks here, between frames, until it is visible again.
     if (const auto parked = ParkWhilePageHidden(); parked != Clock::duration::zero()) {
         paceDeadline += parked;
     }
     if (paceThisFrame) {
+        const Eggy::Perf::Scope present(Eggy::Perf::kPresent); // [eggy]
         PaceToRetraceBoundary(paceDeadline);
         std::lock_guard<std::mutex> lock(g_viMutex);
         s_lastPacedRetraceCount = g_vi.retraceCount;
@@ -666,6 +672,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     }
     // Pre-warm the next frame so subsequent GX work has a valid frame context.
     {
+        const Eggy::Perf::Scope submit(Eggy::Perf::kSubmit); // [eggy]
         UpdateAuroraAndProcessEvents();
         if (BeginAuroraFrame()) {
             g_auroraFrameActive.store(true, std::memory_order_release);
@@ -997,6 +1004,7 @@ extern "C" void VIWaitForRetrace_HLE_801b99ec(CpuContext* ctx)
 
         const auto now = Clock::now();
         if (now < target) {
+            const Eggy::Perf::Scope idle(Eggy::Perf::kIdle); // [eggy]
             SleepPreciselyUntil(target, true);
         }
         AdvanceRetrace(cpu, target, true);

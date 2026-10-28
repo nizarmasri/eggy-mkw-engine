@@ -12,6 +12,13 @@
 //   away=        "port:frame" hands that port to the computer from frame+1
 //   auto=1       go as soon as the race is parked
 //   nojspi       take JSPI away from the page first, as Safari 26 has none: the baton build runs
+// Race API 2 (each only when given):
+//   drawEvery=2  the engine draws one pass in n (1-4); use with skip=0
+//   slowDraw=0   every drawn race frame takes this many microseconds longer (proves the pace)
+//   pacing=1     0 runs the race without wall-clock catch-up (one frame per pass, as before)
+//   results=0    seconds of the game's own finish and results screens after the report
+// Logged: the hash at frame 0 and at every lockstep checkpoint ((frame + 1) % 60 == 0), perf()
+// every 2 s, and the race's game frames per wall second from go to the report.
 (function () {
   'use strict';
   const params = new URLSearchParams(location.search);
@@ -51,6 +58,10 @@
   const finishAllAt = num('finishAll', -1);
   const auto = num('auto', 1) !== 0;
   const away = (params.get('away') || '').split(',').filter(Boolean).map((s) => s.split(':').map(Number));
+  const drawEvery = num('drawEvery', 0);
+  const slowDraw = num('slowDraw', 0);
+  const pacing = num('pacing', 1) !== 0;
+  const resultsSeconds = num('results', 0);
 
   // Config v1 (games/mkw/kit/config.ts): 24 header words, then 12 players of 8 words.
   function buildConfig() {
@@ -72,6 +83,7 @@
     c[14] = field;
     c[15] = humans;
     c[16] = myPort;
+    c[17] = resultsSeconds;
     for (let slot = 0; slot < 12; slot++) {
       const at = 24 + slot * 8;
       if (slot >= field) {
@@ -112,11 +124,17 @@
   });
   engine.onFrame((frame) => {
     if (skip > 0) engine.renderSkip(frame % skip !== skip - 1);
-    if (frame === 0 || frame % 30 === 0) {
+    if (frame === 0 || (frame + 1) % 60 === 0) {
       const k = engine.kart(myPort);
       say('frame', frame, 'hash', (engine.hash() >>> 0).toString(16), 'kart', fmt(k));
     }
   });
+  let perfSeq = -1;
+  setInterval(() => {
+    const p = engine.perf();
+    if (p && p.seq !== perfSeq && (p.seq % 2) === 0) say('perf', fmt(p));
+    if (p) perfSeq = p.seq;
+  }, 500);
 
   function render() {
     const st = engine.state;
@@ -156,12 +174,21 @@
       say('parked');
       for (const [port, frame] of away) engine.away(port, frame);
       if (finishAllAt >= 0) engine.finishAll(finishAllAt);
+      if (drawEvery > 0) engine.drawEvery(drawEvery);
+      if (slowDraw > 0) engine.slowDraw(slowDraw);
+      if (!pacing) engine.pacing(false);
+      let wentAt = 0;
       if (auto) {
         engine.go();
+        wentAt = performance.now();
         say('go');
       }
       report = await engine.ended();
       say('ended', fmt(report));
+      if (wentAt > 0 && report) {
+        const secs = (performance.now() - wentAt) / 1000;
+        say('race wall', 'frames', report.endFrame + 1, 'in', secs.toFixed(2), 's =', ((report.endFrame + 1) / secs).toFixed(1), 'game frames/s');
+      }
     } catch (e) {
       say('failed', e && e.stack || e);
       $('state').textContent = 'failed: ' + (e && e.message || e);

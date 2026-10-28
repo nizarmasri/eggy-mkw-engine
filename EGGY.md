@@ -17,7 +17,8 @@ repository from a pinned commit of this one.
 | `web/tests/web_disc_node_host.mjs`, `web/tests/run_web_disc_test.mjs` | A third Node run of the disc test through `mkwDiscSource`. | Proves the supplied source behaves exactly like the HTTP path (missing files, truncation, odd names). |
 | `runtime/src/hle/input/pad.cpp` | `PAD__Read_HLE` calls `Eggy::OverridePads` after the bindings; in Eggy mode the touch overlay is not applied. | Eggy mode takes every port's pad from the page's race frames (neutral outside a race); a no-op on the stock page. |
 | `runtime/src/hle/vi.cpp` | `IntervalForFormat` divides by a pace factor (1 unless Eggy sets it); `VI_HLE_EggyNoteHostPark` and `VI_HLE_EggySetPace` at the end of the file. | Eggy parks the whole guest while idle or waiting for go (the retrace grid moves on like the hidden-page park), and its lockstep runs the clock 0.9-1.1x. |
-| `runtime/src/hle/gx/gx_egg.cpp` | The `AsyncDisplay::endRender` HLE returns at once when `Eggy::SkipEndRender()`. | Race frames Eggy does not show (`renderSkip`) skip the EFB copy with the draw, so the screen keeps the last shown frame. |
+| `runtime/src/hle/gx/gx_egg.cpp` | The `AsyncDisplay::endRender` HLE returns at once when `Eggy::SkipEndRender()`. | Race frames Eggy does not show (`renderSkip`, `drawEvery`) skip the EFB copy with the draw, so the screen keeps the last shown frame. |
+| `runtime/src/hle/vi.cpp`, `runtime/src/hle/audio/audio.cpp` | `Eggy::Perf::Scope` timers (marked `// [eggy]`) around aurora's frame end/begin, the browser yield, the wait for the retrace boundary, the idle sleeps and the audio mixer. | Race API 2's `perf()` breakdown. They count only in Eggy mode during a race or its results; otherwise one branch. |
 | `runtime/src/host_context.cpp` | A third web backend under `__EMSCRIPTEN_PTHREADS__` (the baton: every context a pthread, one runs at a time, shared TLS), plus `WebHost`'s baton functions and the `mkw_baton_counters` diagnostics. The JSPI backend is untouched. | iOS 26 has no JSPI (below). |
 | `runtime/include/platform/web_host.h` | A baton branch (`__EMSCRIPTEN_PTHREADS__`): `Yield` is a no-op, sleeps block, page visibility is a futex word; `BatonCounter`. The JSPI branch is unchanged. | Same. |
 | `runtime/cmake/PublicProducts.cmake` | `MKW_WEB_THREADS` (`jspi` default, or `baton`): the baton branch links `<Target>Baton.js/.wasm` without `-sJSPI` (cmake/WebBaton.cmake); the post-build copy uses `$<TARGET_FILE_BASE_NAME>` (the same names for JSPI). | Same. |
@@ -55,6 +56,54 @@ all but every 20th frame so the slow CI smoke gets through the 240-frame
 countdown). Note: 0x8020FF9C (`AsyncDisplay::endRender`) is already a
 `PPC_NATIVE_OVERRIDE` in `hle/gx/gx_egg.cpp`, so render skip asks
 `Eggy::SkipEndRender()` there instead of registering a second native.
+
+### Race API 2 (2026-10-28): real pace, picture rate, breakdown, results
+
+Everything of race API 1 is unchanged; a page can tell a race API 2 build by
+`Module.eggy.raceApi === 2` (the shared block's version word is 2).
+
+- **Pace.** A race frame is due every 16.667 ms of wall time divided by the
+  lockstep's pace (on from go; `pacing(false)` turns it off). The calc hook
+  (`Eggy_SceneCalc_80009984`) runs up to three more calcs before the next draw
+  whenever the race is a whole frame behind; each is a full race frame (its own
+  `eggy_pads`, snapshots, hash, `onFrame`). Past six frames behind the debt is
+  dropped (`droppedFrames`), and a lockstep stall over 100 ms is a park (no
+  frames owed). Before this a phone that took 30 ms a frame ran the race at
+  0.55x: the game runs exactly one calc per pass of its frame loop.
+- **`drawEvery(n)`**, n 1-4: during a race and its results only one pass in n
+  draws (the others skip `SceneManager::draw` and the EFB copy, and give the
+  browser a turn instead of presenting). `renderSkip` still works on top
+  during a race (the page's per-frame override).
+- **Cheaper frames.** `eggy_pads` answers without suspending when the page's
+  pad source has the pads (a solo race always); the race hash is taken only on
+  the lockstep's checkpoints ((frame + 1) % 60 == 0), every 120th frame and the
+  report frame; `kart()`/`hud()` snapshot every 4th race frame (and the report
+  frame).
+- **`perf()`**: the last window (about 1 s) of a race or its results, per game
+  frame in ms: `calcMs` (the game's logic), `drawMs` (its GX drawing),
+  `submitMs` (aurora's frame end, submit and next begin), `presentMs` (waiting
+  for the 60 Hz boundary when early), `audioMs` (the mixer), `padsWaitMs` (the
+  lockstep's wait), `yieldMs` (the browser's turns), `idleMs` (guest idle
+  sleeps), `otherMs` (the rest of the window); and `windowMs`, `frames`,
+  `passes`, `drawn`, `gameFramesPerSec` (60 is real speed), `late20`/`late34`
+  (passes longer than 20/34 ms), `drawEvery`, `pacing`, `extraCalcs`,
+  `droppedFrames`, `behindMax`, `seq`. Each part is exclusive: a part timed
+  inside another is taken out of it (`Eggy::Perf::Scope`). Shared block words
+  480-511 (diag is now 32 words, 448-479). Mailboxes: 32 drawEvery, 33 pacing
+  off, 35 slowDraw (test only: microseconds added to every drawn race frame).
+- **Results.** Config word 17 is the seconds of the game's own finish camera
+  and results screens to show after the report (0, the default, keeps race API
+  1's behaviour: idle on the next frame). The report and `onReport` come at the
+  finish exactly as before; then the state is `results` (8) while frames run
+  with neutral pads and nothing goes to the page, then `idle` parks on the last
+  picture (`[eggy] results shown for N ms (F frames)`). `load` and `abort`
+  leave it at once. After a `finishAll` the racers still on the track are
+  handed to the computer so their karts drive home behind the results. With
+  2-4 humans the results and leaderboard pages read the real local player count
+  (only the race HUD has the one-slot patch); not yet checked on screen.
+- **Test page** (`eggy.html`): `drawEvery=`, `slowDraw=`, `pacing=0`,
+  `results=`; it logs the hash at frame 0 and each checkpoint, `perf()` every
+  2 s and `race wall ... game frames/s` from go to the report.
 
 ### How to hook guest code without losing it
 
