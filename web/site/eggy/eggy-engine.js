@@ -228,6 +228,7 @@
       drawEvery(n) { if (eggy.drawEvery) eggy.drawEvery(n); },
       pacing(on) { if (eggy.pacing) eggy.pacing(on); },
       slowDraw(us) { if (eggy.slowDraw) eggy.slowDraw(us); },
+      hashParts(on) { if (eggy.hashParts) eggy.hashParts(on); },
       perf() { return eggy.perf ? eggy.perf() : null; },
 
       // The canvas into `el`; park() takes it back off screen (it keeps its WebGPU context).

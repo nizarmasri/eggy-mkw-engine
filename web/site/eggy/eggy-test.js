@@ -17,6 +17,7 @@
 //   slowDraw=0   every drawn race frame takes this many microseconds longer (proves the pace)
 //   pacing=1     0 runs the race without wall-clock catch-up (one frame per pass, as before)
 //   results=0    seconds of the game's own finish and results screens after the report
+//   hashParts=1  the engine logs each part of every hash it takes, to find where two runs part
 // Logged: the hash at frame 0 and at every lockstep checkpoint ((frame + 1) % 60 == 0), perf()
 // every 2 s, and the race's game frames per wall second from go to the report.
 (function () {
@@ -62,6 +63,7 @@
   const slowDraw = num('slowDraw', 0);
   const pacing = num('pacing', 1) !== 0;
   const resultsSeconds = num('results', 0);
+  const hashParts = num('hashParts', 0) !== 0;
 
   // Config v1 (games/mkw/kit/config.ts): 24 header words, then 12 players of 8 words.
   function buildConfig() {
@@ -177,6 +179,7 @@
       if (drawEvery > 0) engine.drawEvery(drawEvery);
       if (slowDraw > 0) engine.slowDraw(slowDraw);
       if (!pacing) engine.pacing(false);
+      if (hashParts) engine.hashParts(true);
       let wentAt = 0;
       if (auto) {
         engine.go();

@@ -27,6 +27,7 @@
 //   drawEvery(n)   draw one pass of the frame loop in n (1-4) during a race and its results
 //   pacing(on)     keep the race at the wall clock's 60 frames/s (on by default)
 //   slowDraw(us)   test only: every drawn race frame takes this much longer
+//   hashParts(on)  test only: the engine logs each part of every hash it takes ("hash parts")
 //   perf()         the last second's breakdown, or null (see `perf()` below and EGGY.md)
 // kart() and hud() are snapshots of every 4th race frame, hash() of the lockstep's checkpoint
 // frames (every 60th: (frame + 1) % 60 == 0), every 120th and the last.
@@ -107,6 +108,7 @@ addToLibrary({
         'drawEvery': (n) => Eggy.set(Eggy.W.DRAW_EVERY, Math.max(1, Math.min(4, n | 0))),
         'pacing': (on) => Eggy.set(Eggy.W.PACING_OFF, on ? 0 : 1),
         'slowDraw': (us) => Eggy.set(Eggy.W.SLOW_DRAW_US, Math.max(0, Math.min(200000, us | 0))),
+        'hashParts': (on) => Eggy.set(Eggy.W.DEBUG, on ? 1 : 0),
         'perf': () => Eggy.perf(),
         'debug': () => Eggy.debug(),
       });

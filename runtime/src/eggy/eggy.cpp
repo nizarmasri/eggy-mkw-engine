@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -716,6 +717,59 @@ struct Fnv {
     }
 };
 
+struct LineBuf {
+    char text[4096];
+    size_t at = 0;
+    __attribute__((format(printf, 2, 3))) void Put(const char* fmt, ...) {
+        if (at >= sizeof text) return;
+        va_list args;
+        va_start(args, fmt);
+        const int n = std::vsnprintf(text + at, sizeof text - at, fmt, args);
+        va_end(args);
+        if (n > 0) at += static_cast<size_t>(n);
+    }
+};
+
+// Test only (the debug mailbox's bit 0, eggy.html ?hashParts=1): HashRace's parts one by one, so
+// two runs whose hashes differ show which part they differ on. Physics is hashed, the rest raw.
+void LogHashParts(int frame) {
+    static LineBuf line;
+    line.at = 0;
+    auto hashed = [](uint32_t addr, int n) {
+        Fnv f;
+        f.Words(addr, n);
+        return f.h;
+    };
+    line.Put("[eggy] hash parts frame %d:", frame);
+    const uint32_t rm = RaceManager();
+    if (rm) {
+        line.Put(" rm %08x %08x", R32(rm + 0x28), R32(rm + 0x20));
+        for (uint32_t off : {0x4u, 0x8u}) {
+            const uint32_t random = Ptr(rm + off);
+            line.Put(" rng%u %08x", off / 4, random ? hashed(random + 0x8, 4) : 0u);
+        }
+    }
+    const int karts = KartCount();
+    for (int slot = 0; slot < karts; ++slot) {
+        line.Put(" | k%d", slot);
+        const uint32_t ptrs = KartPointers(slot);
+        if (!ptrs) continue;
+        const uint32_t status = Ptr(ptrs + 0x4);
+        const uint32_t body = Ptr(ptrs + 0x8);
+        const uint32_t holder = body ? Ptr(body + 0x90) : 0;
+        const uint32_t phys = holder ? Ptr(holder + 0x4) : 0;
+        const uint32_t move = Ptr(ptrs + 0x28);
+        if (phys) line.Put(" pos %08x vel %08x rot %08x", hashed(phys + 0x68, 3), hashed(phys + 0xD4, 3), hashed(phys + 0xF0, 4));
+        if (move) line.Put(" move %08x %08x %08x", R32(move + 0x20), R32(move + 0xFC), R32(move + 0x100));
+        if (status) line.Put(" status %08x %08x %08x", R32(status + 0x4), R32(status + 0x8), R32(status + 0xC));
+        const uint32_t rp = RacePlayer(slot);
+        if (rp) line.Put(" player %08x %08x %08x %08x", R32(rp + 0xC), R32(rp + 0x20), R32(rp + 0x24), R32(rp + 0x38));
+        const uint32_t ip = ItemPlayer(slot);
+        if (ip) line.Put(" item %08x %08x", R32(ip + 0x8C), R32(ip + 0x90));
+    }
+    std::printf("%s\n", line.text);
+}
+
 // The race state that has to agree between phones in lockstep: every kart's physics and drive
 // state, every racer's progress, the items held and the race's random generators.
 uint32_t HashRace(int frame) {
@@ -766,6 +820,7 @@ uint32_t HashRace(int frame) {
             if (random) f.Words(random + 0x8, 4);
         }
     }
+    if ((Mail(kDebug) & 1) != 0) LogHashParts(frame);
     return f.h;
 }
 
