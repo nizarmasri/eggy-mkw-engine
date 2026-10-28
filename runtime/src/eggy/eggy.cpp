@@ -1124,9 +1124,12 @@ extern "C" void Eggy_SceneCalc_80009984(CpuContext* ctx) {
         InvokeDirectCpu<0x8023AE60>(ctx);
         return;
     }
+    // calc leaves r3 (its `this`) clobbered; everything else it takes is preserved by the ABI.
+    const uint32_t sceneManager = ctx->gpr[3];
     RunCalc(ctx);
     for (int extra = 0; extra < kMaxExtraCalcs && FramesBehind(SteadyClock::now()) >= 1; ++extra) {
         ++g_perfWin.extra;
+        ctx->gpr[3] = sceneManager;
         RunCalc(ctx);
     }
 }
