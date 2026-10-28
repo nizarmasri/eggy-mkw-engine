@@ -6,6 +6,7 @@
 #include "ax_dsp.h"
 #include "music_attenuation.h"
 #include "runtime_log.h"
+#include "eggy/eggy.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -516,6 +517,7 @@ int64_t ConsumeAudioPollDeltaMicros()
 
 void Audio_HLE_Poll(CpuContext* ctx)
 {
+    const Eggy::Perf::Scope perf(Eggy::Perf::kAudio); // [eggy]
     MusicAttenuation::TickGuest();
     Audio_HLE_Tick(ctx, static_cast<uint32_t>(ConsumeAudioPollDeltaMicros()));
 }
@@ -531,6 +533,7 @@ void Audio_HLE_PollDeferred()
     CpuContext* cpu = interrupt.get();
 
     OS_HLE_BeginDeferredGuestCallbacks();
+    const Eggy::Perf::Scope perf(Eggy::Perf::kAudio); // [eggy]
     try {
         Audio_HLE_Tick(cpu, static_cast<uint32_t>(ConsumeAudioPollDeltaMicros()));
     } catch (...) {

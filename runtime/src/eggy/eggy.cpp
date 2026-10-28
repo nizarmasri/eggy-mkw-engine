@@ -15,7 +15,14 @@
 //
 // States: booting (the game is starting) -> idle (parked, nothing runs) -> loading (a section
 // change to the race runs with neutral pads) -> parked (the race's first frame, nothing runs)
-// -> racing (one calc per race frame, pads from the page) -> finished (report written) -> idle.
+// -> racing (one calc per race frame, pads from the page) -> finished (report written) ->
+// results (the config asked for N seconds of the game's own finish and results screens: frames
+// run with neutral pads, nothing goes back to the page) -> idle.
+//
+// Pace: a race frame is due every 16.667 ms of wall time (divided by the lockstep's pace). A phone
+// that falls a whole frame behind runs up to three more calcs before it draws again, so the race
+// keeps the game's real speed and only the picture rate drops; past six frames behind it lets the
+// debt go and runs slow instead of spiralling. drawEvery(n) draws one frame in n on purpose.
 
 #include "eggy/eggy.h"
 
@@ -72,9 +79,11 @@ constexpr int kMagic = 0, kVersion = 1, kState = 2, kFrame = 3, kHashFrame = 4, 
               kCountdown = 7, kReportSeq = 8, kError = 9, kSection = 10, kTicks = 11, kLogicUs = 12,
               kDrawUs = 13, kPadCalls = 14, kRaceTimer = 15;
 constexpr int kLoadSeq = 16, kGoSeq = 17, kAbortSeq = 18, kRenderSkip = 19, kMusic = 20, kSfx = 21,
-              kInsets = 22, kPace = 26, kFinishAll = 27, kAway = 28, kDebug = 34;
+              kInsets = 22, kPace = 26, kFinishAll = 27, kAway = 28, kDrawEvery = 32, kPacingOff = 33,
+              kDebug = 34, kSlowDrawUs = 35;
 constexpr int kConfig = 48, kConfigWords = 120, kPads = 168, kKarts = 176, kKartWords = 32, kHud = 304,
-              kReport = 384, kDiag = 448, kWords = 512;
+              kReport = 384, kDiag = 448, kPerf = 480, kPerfWords = 32, kWords = 512;
+static_assert(kDiag + 32 <= kPerf && kPerf + kPerfWords <= kWords, "the diag and perf blocks overlap");
 
 alignas(16) int32_t g_shared[kWords];
 
@@ -87,8 +96,10 @@ enum State : int32_t {
     kRacing = 5,
     kFinished = 6,
     kFailed = 7,
+    kResults = 8,
 };
-const char* const kStateNames[] = {"off", "booting", "idle", "loading", "parked", "racing", "finished", "failed"};
+const char* const kStateNames[] = {"off",      "booting", "idle",   "loading", "parked",
+                                   "racing",   "finished", "failed", "results"};
 
 // Errors (kError).
 constexpr int32_t kErrBadConfig = 1, kErrNoSectionMgr = 2, kErrLoadTimeout = 3;
@@ -96,7 +107,8 @@ constexpr int32_t kErrBadConfig = 1, kErrNoSectionMgr = 2, kErrLoadTimeout = 3;
 // ---- Config v1 (games/mkw/kit/config.ts in Eggy) ----
 constexpr int kCfgVersion = 0, kCfgSeed = 1, kCfgGameMode = 2, kCfgBattleType = 3, kCfgEngineClass = 4,
               kCfgMirror = 5, kCfgItemMode = 6, kCfgCpuMode = 7, kCfgTeams = 8, kCfgCourse = 9, kCfgLaps = 10,
-              kCfgField = 14, kCfgHumans = 15, kCfgMyPort = 16, kCfgPlayers = 24, kCfgPlayerWords = 8;
+              kCfgField = 14, kCfgHumans = 15, kCfgMyPort = 16, kCfgResultsSeconds = 17, kCfgPlayers = 24,
+              kCfgPlayerWords = 8;
 constexpr int32_t kTypeHuman = 0, kTypeNone = 5;
 constexpr int kGrid = 12;
 
@@ -183,6 +195,7 @@ int g_mtMax = 270, g_smtMax = 300;
 int32_t g_music = 1, g_sfx = 1;
 float g_pace = 1.0f;
 bool g_skipThisDraw = false;
+int g_resultsSeconds = 0; // config word 17: the game's own finish and results screens, 0 = none
 
 // Timing: the calc and draw cost of the last 128 race frames, p95 published every 30 frames.
 std::array<uint32_t, 128> g_logicUs{}, g_drawUs{};
@@ -195,6 +208,65 @@ using SteadyClock = std::chrono::steady_clock;
 uint32_t ElapsedUs(SteadyClock::time_point since) {
     return static_cast<uint32_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - since).count());
+}
+
+int64_t Nanos(SteadyClock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); }
+
+// ---- Pace: race frame g_frame is due at g_due (wall clock) ----
+constexpr int kMaxExtraCalcs = 3; // calcs a late pass runs on top of its own
+constexpr int kMaxDebtFrames = 6; // further behind than this, the debt is dropped
+SteadyClock::time_point g_due;
+int g_drawPass = 0; // passes of the frame loop since go (drawEvery counts these)
+SteadyClock::time_point g_resultsStarted;
+int g_resultsFrames = 0;
+
+SteadyClock::duration FramePeriod() {
+    return std::chrono::nanoseconds(static_cast<int64_t>(16666667.0 / static_cast<double>(g_pace)));
+}
+
+// ---- Perf: the breakdown of the last window (about a second), published at kPerf ----
+struct PerfOpen {
+    int part;
+    SteadyClock::time_point start;
+    int64_t childNs;
+};
+std::array<PerfOpen, 16> g_perfOpen{};
+int g_perfDepth = 0;
+std::array<int64_t, Eggy::Perf::kParts> g_perfNs{};
+struct PerfWindow {
+    SteadyClock::time_point start;
+    SteadyClock::time_point lastPass;
+    int32_t frames = 0, passes = 0, drawn = 0, late20 = 0, late34 = 0, extra = 0, dropped = 0, behindMax = 0;
+};
+PerfWindow g_perfWin;
+
+bool PerfCounting() { return g_state == kRacing || g_state == kResults; }
+
+void ResetPerfWindow(SteadyClock::time_point now) {
+    g_perfWin = PerfWindow{};
+    g_perfWin.start = now;
+    g_perfWin.lastPass = now;
+    g_perfNs.fill(0);
+}
+
+void PublishPerf(SteadyClock::time_point now) {
+    int32_t* w = &g_shared[kPerf];
+    w[0] = w[0] + 1;
+    w[1] = static_cast<int32_t>(std::min<int64_t>(Nanos(now - g_perfWin.start) / 1000, INT32_MAX));
+    w[2] = g_perfWin.frames;
+    w[3] = g_perfWin.passes;
+    w[4] = g_perfWin.drawn;
+    for (int i = 0; i < Eggy::Perf::kParts; ++i) {
+        w[5 + i] = static_cast<int32_t>(std::min<int64_t>(g_perfNs[i] / 1000, INT32_MAX));
+    }
+    w[13] = g_perfWin.late20;
+    w[14] = g_perfWin.late34;
+    w[15] = std::clamp(Mail(kDrawEvery), 1, 4);
+    w[16] = g_perfWin.extra;
+    w[17] = g_perfWin.dropped;
+    w[18] = g_perfWin.behindMax;
+    w[19] = Mail(kPacingOff) != 0 ? 0 : 1;
+    ResetPerfWindow(now);
 }
 
 void SetState(State s) {
@@ -372,6 +444,7 @@ bool ReadConfig() {
     const int mode = g_cfg[kCfgGameMode];
     if (mode != 1 && mode != 3) return false;
     g_field = std::clamp(g_cfg[kCfgField], 1, kGrid);
+    g_resultsSeconds = std::clamp(g_cfg[kCfgResultsSeconds], 0, 30);
     g_battle = mode == 3;
     g_mirror = g_cfg[kCfgMirror] == 1;
     g_slotOfPort = {-1, -1, -1, -1};
@@ -816,8 +889,35 @@ void PreCalc(CpuContext* ctx) {
             continue;
         }
         case kFinished:
+            if (g_resultsSeconds > 0 && !LoadPending() && !AbortPending()) {
+                g_resultsStarted = SteadyClock::now();
+                g_resultsFrames = 0;
+                SetState(kResults);
+                return; // this frame already runs the results
+            }
             SetState(kIdle);
             continue;
+        case kResults: {
+            // The game's own finish and results screens, with neutral pads, until the config's
+            // seconds are up; then idle parks on the last picture. Nothing here reaches the page.
+            if (LoadPending()) {
+                SetState(kIdle);
+                continue;
+            }
+            if (AbortPending()) {
+                g_seenAbort = Mail(kAbortSeq);
+                SetState(kIdle);
+                continue;
+            }
+            const uint32_t shownMs = ElapsedUs(g_resultsStarted) / 1000;
+            if (shownMs >= static_cast<uint32_t>(g_resultsSeconds) * 1000u) {
+                std::printf("[eggy] results shown for %u ms (%d frames)\n", shownMs, g_resultsFrames);
+                SetState(kIdle);
+                continue;
+            }
+            ++g_resultsFrames;
+            return;
+        }
         case kFailed:
             if (!LoadPending()) return;
             SetState(kIdle);
@@ -863,6 +963,9 @@ void PreCalc(CpuContext* ctx) {
                 g_seenGo = Mail(kGoSeq);
                 g_frame = 0;
                 g_shared[kFrame] = 0;
+                g_due = SteadyClock::now();
+                g_drawPass = 0;
+                ResetPerfWindow(g_due);
                 SetState(kRacing);
                 continue;
             }
@@ -879,7 +982,9 @@ void PreCalc(CpuContext* ctx) {
                 continue;
             }
             const auto start = SteadyClock::now();
+            const int padsToken = Eggy::Perf::Start(Eggy::Perf::kPads);
             const int got = eggy_pads(g_frame, reinterpret_cast<uint8_t*>(&g_shared[kPads]));
+            Eggy::Perf::Stop(padsToken);
             const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(SteadyClock::now() - start);
             if (got < 0) {
                 continue; // the wait was cancelled by abort or a new load
@@ -887,10 +992,12 @@ void PreCalc(CpuContext* ctx) {
             if (got == 0) {
                 for (int i = 0; i < 4; ++i) g_shared[kPads + i] = 0;
             }
-            // A long lockstep stall is a park: no retrace catch-up burst afterwards.
+            // A long lockstep stall is a park: no retrace catch-up burst afterwards, and no race
+            // frames owed for it either.
             if (waited > std::chrono::milliseconds(100)) {
                 WebHost::ParkedNanosCounter().fetch_add(waited.count(), std::memory_order_relaxed);
                 VI_HLE_EggyNoteHostPark(waited);
+                g_due += waited;
             }
             g_padsLive = true;
             RebindIfMoved(ctx);
@@ -917,16 +1024,27 @@ void PostCalc(CpuContext* ctx, uint32_t calcUs) {
     }
     const int stage = Stage();
     const int raceFrames = RaceFrames();
-    for (int port = 0; port < 4; ++port) SnapshotKart(port, stage, raceFrames);
-    SnapshotHud(frame);
-    const uint32_t hash = HashRace(frame);
-    g_shared[kHash] = static_cast<int32_t>(hash);
-    g_shared[kHashFrame] = frame;
+    // The snapshots feed the page's touch controls and HUD: a quarter of the frames is plenty.
+    // The hash is read by the lockstep on every 60th frame (lockstep.ts HASH_EVERY: the frames
+    // where (frame + 1) % 60 == 0), logged every 120th and sent with the report.
+    if ((frame & 3) == 0) {
+        for (int port = 0; port < 4; ++port) SnapshotKart(port, stage, raceFrames);
+        SnapshotHud(frame);
+    }
+    bool hashed = false;
+    uint32_t hash = 0;
+    if ((frame + 1) % 60 == 0 || (frame % 120) == 0) {
+        hash = HashRace(frame);
+        hashed = true;
+        g_shared[kHash] = static_cast<int32_t>(hash);
+        g_shared[kHashFrame] = frame;
+    }
     g_shared[kStage] = stage;
     g_shared[kCountdown] = stage == 1 ? std::max(0, 240 - raceFrames) : -1;
     g_shared[kRaceTimer] = raceFrames;
     g_frame = frame + 1;
     g_shared[kFrame] = g_frame;
+    g_due += FramePeriod();
     if ((frame % 30) == 29) PublishTiming();
     if ((frame % 120) == 0) {
         WriteDiag();
@@ -940,7 +1058,23 @@ void PostCalc(CpuContext* ctx, uint32_t calcUs) {
     const int32_t finishAll = Mail(kFinishAll);
     const bool forced = finishAll >= 0 && frame >= finishAll;
     if (forced || stage >= 4) {
+        if (!hashed) {
+            hash = HashRace(frame);
+            g_shared[kHash] = static_cast<int32_t>(hash);
+            g_shared[kHashFrame] = frame;
+        }
+        for (int port = 0; port < 4; ++port) SnapshotKart(port, stage, raceFrames);
+        SnapshotHud(frame);
         WriteReport(frame, hash, forced ? "finishAll" : "race over");
+        // Finished by place while still on the track: the computer drives them home behind the
+        // results, rather than karts rolling to a stop on neutral pads.
+        if (forced && g_resultsSeconds > 0) {
+            for (int port = 0; port < 4; ++port) {
+                const int slot = g_slotOfPort[port];
+                const uint32_t rp = slot >= 0 ? RacePlayer(slot) : 0;
+                if (rp && !g_awayApplied[port] && (R32(rp + 0x38) & 2u) == 0) ApplyAway(ctx, port);
+            }
+        }
         SetState(kFinished);
         eggy_report_ready();
     }
@@ -950,35 +1084,98 @@ void PostCalc(CpuContext* ctx, uint32_t calcUs) {
 
 // ---- Hooks ----
 
-// RKSceneManager::calc (b EGG::SceneManager::calc): the frame boundary.
+namespace {
+// One calc of the game with Eggy's frame boundary around it.
+void RunCalc(CpuContext* ctx) {
+    PreCalc(ctx);
+    const bool counted = PerfCounting();
+    const auto start = SteadyClock::now();
+    const int token = Eggy::Perf::Start(Eggy::Perf::kCalc);
+    InvokeDirectCpu<0x8023AE60>(ctx);
+    Eggy::Perf::Stop(token);
+    const uint32_t calcUs = ElapsedUs(start);
+    if (counted) ++g_perfWin.frames;
+    PostCalc(ctx, calcUs);
+}
+
+// How many whole frames the race is behind the wall clock (0 on time or ahead). Past
+// kMaxDebtFrames the schedule moves up and the rest is let go.
+int FramesBehind(SteadyClock::time_point now) {
+    if (g_state != kRacing || Mail(kPacingOff) != 0 || now < g_due) return 0;
+    const auto period = FramePeriod();
+    int64_t behind = Nanos(now - g_due) / Nanos(period);
+    if (behind > kMaxDebtFrames) {
+        g_due += period * (behind - kMaxDebtFrames);
+        g_perfWin.dropped += static_cast<int32_t>(behind - kMaxDebtFrames);
+        behind = kMaxDebtFrames;
+    }
+    g_perfWin.behindMax = std::max(g_perfWin.behindMax, static_cast<int32_t>(behind));
+    return static_cast<int>(behind);
+}
+} // namespace
+
+// RKSceneManager::calc (b EGG::SceneManager::calc): the frame boundary. A race that has fallen a
+// whole frame behind the wall clock runs up to kMaxExtraCalcs more calcs here, before the next
+// draw: the game keeps its real speed and the picture rate gives. Each extra calc is a full race
+// frame (its own pads, snapshots, hash and onFrame), so the race is the same on every phone
+// whatever each one draws.
 extern "C" void Eggy_SceneCalc_80009984(CpuContext* ctx) {
     if (!Eggy::Enabled()) {
         InvokeDirectCpu<0x8023AE60>(ctx);
         return;
     }
-    PreCalc(ctx);
-    const auto start = SteadyClock::now();
-    InvokeDirectCpu<0x8023AE60>(ctx);
-    const uint32_t calcUs = ElapsedUs(start);
-    PostCalc(ctx, calcUs);
+    RunCalc(ctx);
+    for (int extra = 0; extra < kMaxExtraCalcs && FramesBehind(SteadyClock::now()) >= 1; ++extra) {
+        ++g_perfWin.extra;
+        RunCalc(ctx);
+    }
 }
 REGISTER_NATIVE_FUNCTION_AS(0x80009984, Eggy_SceneCalc_80009984, "Eggy_SceneCalc_80009984");
 
-// RKSceneManager::draw (b EGG::SceneManager::draw): skipped on race frames the page asked not to
-// see (renderSkip), timed otherwise.
+// RKSceneManager::draw (b EGG::SceneManager::draw): the start of a pass of the frame loop. Skipped
+// on race frames the page asked not to see (renderSkip) and, during a race or its results, on all
+// but one pass in drawEvery; timed otherwise. A skipped pass still gives the browser its turn
+// (a drawn one does when it presents), so input and the lockstep's packets keep arriving.
 extern "C" void Eggy_SceneDraw_80009988(CpuContext* ctx) {
     if (!Eggy::Enabled()) {
         InvokeDirectCpu<0x8023AEAC>(ctx);
         return;
     }
-    g_skipThisDraw = g_state == kRacing && Mail(kRenderSkip) != 0;
+    const bool racing = g_state == kRacing;
+    const bool counted = PerfCounting();
+    if (counted) {
+        const auto now = SteadyClock::now();
+        const int64_t passUs = Nanos(now - g_perfWin.lastPass) / 1000;
+        if (g_perfWin.passes > 0 && passUs > 20000) ++g_perfWin.late20;
+        if (g_perfWin.passes > 0 && passUs > 34000) ++g_perfWin.late34;
+        g_perfWin.lastPass = now;
+        ++g_perfWin.passes;
+        if (now - g_perfWin.start >= std::chrono::seconds(1)) PublishPerf(now);
+    }
+    const int every = std::clamp(Mail(kDrawEvery), 1, 4);
+    const bool stepped = counted && every > 1 && (g_drawPass++ % every) != 0;
+    g_skipThisDraw = stepped || (racing && Mail(kRenderSkip) != 0);
     if (g_skipThisDraw) {
         ++g_drawsSkipped;
+        const Eggy::Perf::Scope yield(Eggy::Perf::kYield);
+        WebHost::Yield();
         return;
     }
+    if (counted) ++g_perfWin.drawn;
     const auto start = SteadyClock::now();
-    InvokeDirectCpu<0x8023AEAC>(ctx);
-    if (g_state == kRacing) {
+    {
+        const Eggy::Perf::Scope draw(Eggy::Perf::kDraw);
+        InvokeDirectCpu<0x8023AEAC>(ctx);
+        // Test hook (the engine's eggy.html ?slowDraw=): a draw this much slower, to prove the
+        // race keeps its pace on a phone that draws slowly.
+        const int32_t slowUs = racing ? Mail(kSlowDrawUs) : 0;
+        if (slowUs > 0) {
+            const auto until = SteadyClock::now() + std::chrono::microseconds(std::min(slowUs, 200000));
+            while (SteadyClock::now() < until) {
+            }
+        }
+    }
+    if (racing) {
         g_drawUs[g_drawN++ % 128] = ElapsedUs(start);
     }
 }
@@ -1094,7 +1291,7 @@ void Initialize() noexcept {
     }
     std::memset(g_shared, 0, sizeof g_shared);
     g_shared[kMagic] = 0x59474745; // 'EGGY'
-    g_shared[kVersion] = 1;
+    g_shared[kVersion] = 2;
     g_shared[kHashFrame] = -1;
     g_shared[kStage] = -1;
     g_shared[kCountdown] = -1;
@@ -1103,6 +1300,7 @@ void Initialize() noexcept {
     PutF32(kPace, 1.0f);
     g_shared[kFinishAll] = -1;
     for (int p = 0; p < 4; ++p) g_shared[kAway + p] = -1;
+    g_shared[kDrawEvery] = 1;
     g_shared[kHud] = -1;
     g_state = kOff;
     std::printf("[eggy] Eggy mode: shared block at 0x%08x (%d bytes)\n",
@@ -1119,6 +1317,33 @@ bool Enabled() noexcept {
 }
 
 bool SkipEndRender() noexcept { return g_enabled == 1 && g_skipThisDraw; }
+
+namespace Perf {
+
+int Start(Part part) noexcept {
+    if (g_enabled != 1 || !PerfCounting() || g_perfDepth >= static_cast<int>(g_perfOpen.size())) {
+        return -1;
+    }
+    g_perfOpen[g_perfDepth] = PerfOpen{part, SteadyClock::now(), 0};
+    return g_perfDepth++;
+}
+
+void Stop(int token) noexcept {
+    if (token < 0 || token >= g_perfDepth) {
+        return;
+    }
+    const auto now = SteadyClock::now();
+    // Anything opened after this token and never stopped (a guest stack switched away inside it)
+    // is closed here too, each part with its own time.
+    while (g_perfDepth > token) {
+        const PerfOpen open = g_perfOpen[--g_perfDepth];
+        const int64_t total = Nanos(now - open.start);
+        g_perfNs[open.part] += std::max<int64_t>(0, total - open.childNs);
+        if (g_perfDepth > 0) g_perfOpen[g_perfDepth - 1].childNs += total;
+    }
+}
+
+} // namespace Perf
 
 bool OverridePads(PADStatus* statuses, uint32_t count) noexcept {
     if (!Enabled()) {

@@ -20,7 +20,7 @@
 (function (root) {
   'use strict';
 
-  const STATE_MAP = { off: 'booting', booting: 'booting', idle: 'ready', loading: 'loading', parked: 'parked', racing: 'racing', finished: 'finished', failed: 'failed' };
+  const STATE_MAP = { off: 'booting', booting: 'booting', idle: 'ready', loading: 'loading', parked: 'parked', racing: 'racing', finished: 'finished', results: 'results', failed: 'failed' };
 
   function whyNot() {
     if (!root.navigator || !root.navigator.gpu) return 'This browser has no WebGPU.';
@@ -193,6 +193,11 @@
       finishAll(frame) { if (eggy.finishAll) eggy.finishAll(frame); },
       pace(factor) { if (eggy.pace) eggy.pace(factor); },
       timing() { return eggy.timing ? eggy.timing() : null; },
+      // Race API 2 (library_eggy.js): picture rate, wall-clock pace and the per-frame breakdown.
+      drawEvery(n) { if (eggy.drawEvery) eggy.drawEvery(n); },
+      pacing(on) { if (eggy.pacing) eggy.pacing(on); },
+      slowDraw(us) { if (eggy.slowDraw) eggy.slowDraw(us); },
+      perf() { return eggy.perf ? eggy.perf() : null; },
 
       // The canvas into `el`; park() takes it back off screen (it keeps its WebGPU context).
       attach(el) {
