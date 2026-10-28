@@ -93,8 +93,24 @@ Everything of race API 1 is unchanged; a page can tell a race API 2 build by
   2-4 humans the results and leaderboard pages read the real local player count
   (only the race HUD has the one-slot patch); not yet checked on screen.
 - **Test page** (`eggy.html`): `drawEvery=`, `slowDraw=`, `pacing=0`,
-  `results=`; it logs the hash at frame 0 and each checkpoint, `perf()` every
-  2 s and `race wall ... game frames/s` from go to the report.
+  `results=`, `hashParts=1` (the engine logs every hash's parts: `[eggy] hash
+  parts frame N: ...`, mailbox 34 bit 0); it logs the hash at frame 0 and each
+  checkpoint, `perf()` every 2 s and `race wall ... game frames/s` from go to
+  the report.
+
+**Smokes so far (engine-aa953d7, engine-affbb34-baton).** The CI runner is
+slower than a phone (calc 14-29 ms and a software-WebGPU submit of 100-140 ms
+a frame), so every run was always behind and ran exactly four calcs a pass:
+6-29 game frames/s, never 60. In that state the race is the same whatever is
+drawn: report hash 2500981042 at frame 1500 with drawEvery 1, 2 and 4, with
+slowDraw=30000, and on the baton build. Results ran 10.5 s; two humans reach
+the report. **Open:** race API 1 (one calc a pass) gives 2205138225 for the same
+race. The frame-0 hash and the human kart's speed at every checkpoint agree;
+the 120-frame hashes agree to 480, differ at 600, agree at 720 and differ from
+840. So some part of the hash depends on how many calcs a pass runs, and two
+phones that catch up differently would report a desync. Until a `pacing=0` vs
+`pacing=1` pair with `hashParts=1` shows which part (and it is fixed), Eggy
+should keep `pacing(false)`.
 
 ### How to hook guest code without losing it
 
