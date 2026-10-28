@@ -1190,6 +1190,62 @@ extern "C" void Eggy_SceneCalc_80009984(CpuContext* ctx) {
 }
 REGISTER_NATIVE_FUNCTION_AS(0x80009984, Eggy_SceneCalc_80009984, "Eggy_SceneCalc_80009984");
 
+namespace {
+// The race's two random generators (RaceManager +0x4 and +0x8, each a Random whose state is the
+// four words at +0x8: the 64-bit value and seed) belong to the race. Drawing takes numbers from
+// the second too (effects set up when first drawn), so a phone that drew more often moved it
+// sooner than one that drew less, and their hashes parted while their karts did not: rng2 alone
+// differed between a smoke drawing every 4th frame and one drawing every 20th. So every draw runs
+// on its own copy of both: swapped in before SceneManager::draw and out after it. The race's move
+// with its calcs alone, whatever each phone draws; the effects still vary from draw to draw.
+constexpr int kRandomWords = 4;
+struct DrawRandoms {
+    uint32_t rm = 0;                     // the RaceManager the draw's copies were taken from
+    uint32_t random[2] = {};             // its generators, as read before this draw
+    uint32_t own[2][kRandomWords] = {};  // the draw's state of each
+    uint32_t race[2][kRandomWords] = {}; // the race's, held aside while a draw runs
+};
+DrawRandoms g_drawRandoms;
+
+// Before a draw: the race's generators take the draw's state. False when there is no race.
+bool DrawRandomsIn() {
+    DrawRandoms& d = g_drawRandoms;
+    const uint32_t rm = RaceManager();
+    if (!rm) {
+        d.rm = 0;
+        return false;
+    }
+    const bool fresh = rm != d.rm;
+    d.rm = rm;
+    for (int i = 0; i < 2; ++i) {
+        d.random[i] = Ptr(rm + 0x4 + 4 * i);
+        if (!d.random[i]) continue;
+        for (int w = 0; w < kRandomWords; ++w) {
+            const uint32_t at = d.random[i] + 0x8 + 4 * w;
+            d.race[i][w] = R32(at);
+            if (fresh) d.own[i][w] = d.race[i][w];
+            W32(at, d.own[i][w]);
+        }
+    }
+    return true;
+}
+
+// After it: the draw keeps where it got to, and the race gets its own back.
+void DrawRandomsOut() {
+    DrawRandoms& d = g_drawRandoms;
+    const uint32_t rm = RaceManager();
+    for (int i = 0; i < 2; ++i) {
+        // A draw never ends a race, but never write through a generator it no longer has.
+        if (!d.random[i] || rm != d.rm || Ptr(rm + 0x4 + 4 * i) != d.random[i]) continue;
+        for (int w = 0; w < kRandomWords; ++w) {
+            const uint32_t at = d.random[i] + 0x8 + 4 * w;
+            d.own[i][w] = R32(at);
+            W32(at, d.race[i][w]);
+        }
+    }
+}
+} // namespace
+
 // RKSceneManager::draw (b EGG::SceneManager::draw): the start of a pass of the frame loop. Skipped
 // on race frames the page asked not to see (renderSkip) and, during a race or its results, on all
 // but one pass in drawEvery; timed otherwise. A skipped pass still gives the browser its turn
@@ -1223,7 +1279,9 @@ extern "C" void Eggy_SceneDraw_80009988(CpuContext* ctx) {
     const auto start = SteadyClock::now();
     {
         const Eggy::Perf::Scope draw(Eggy::Perf::kDraw);
+        const bool race = DrawRandomsIn();
         InvokeDirectCpu<0x8023AEAC>(ctx);
+        if (race) DrawRandomsOut();
         // Test hook (the engine's eggy.html ?slowDraw=): a draw this much slower, to prove the
         // race keeps its pace on a phone that draws slowly.
         const int32_t slowUs = racing ? Mail(kSlowDrawUs) : 0;
