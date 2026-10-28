@@ -104,13 +104,17 @@ a frame), so every run was always behind and ran exactly four calcs a pass:
 6-29 game frames/s, never 60. In that state the race is the same whatever is
 drawn: report hash 2500981042 at frame 1500 with drawEvery 1, 2 and 4, with
 slowDraw=30000, and on the baton build. Results ran 10.5 s; two humans reach
-the report. **Open:** race API 1 (one calc a pass) gives 2205138225 for the same
-race. The frame-0 hash and the human kart's speed at every checkpoint agree;
-the 120-frame hashes agree to 480, differ at 600, agree at 720 and differ from
-840. So some part of the hash depends on how many calcs a pass runs, and two
-phones that catch up differently would report a desync. Until a `pacing=0` vs
-`pacing=1` pair with `hashParts=1` shows which part (and it is fixed), Eggy
-should keep `pacing(false)`.
+the report. Race API 1 gave 2205138225 for the same race, which looked like
+catch-up changing the race. It was not: those smokes ran with `skip=0` (drawing
+every pass) and API 1's with the test page's default render skip (one frame in
+20). With engine-c8b5f78 and `hashParts=1`, `pacing=0` and `pacing=1` agree on
+every part at every checkpoint (2205138225, both with the render skip), and
+`skip=0` against the render skip differs in one part only, `rng2` (RaceManager
++0x8), at some checkpoints and not others: the same sequence, reached sooner by
+the run that draws more. Drawing takes numbers from the race's second generator
+(effects set up when first drawn). Fixed in the draw hook: every draw runs on its
+own copy of both race generators (`DrawRandomsIn`/`DrawRandomsOut`), so the
+race's move with its calcs alone whatever a phone draws.
 
 ### How to hook guest code without losing it
 
