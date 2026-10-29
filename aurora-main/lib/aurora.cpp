@@ -9,6 +9,7 @@
 #include "webgpu/gpu.hpp"
 #include "webgpu/metalfx.hpp"
 #include "webgpu/web_render_thread.hpp"
+#include <aurora/web_render_thread.h>
 #include <webgpu/webgpu_cpp.h>
 #endif
 
@@ -281,6 +282,9 @@ FrameWorkerState g_frameWorker;
 // [eggy] The render thread's cycle presented its frame and waits for the producer's begin_frame
 // before it prepares the next one (guarded by g_frameWorker.mutex). See web_cycle_job.
 bool g_webCycleDone = false;
+// [eggy] Bumped (aurora_web_notify) whenever SEALED or DONE is published, so a producer on the
+// browser main thread can suspend until then instead of spinning (wait_for_frame_worker_private).
+int32_t g_webPhaseWord = 0;
 #endif
 
 bool frame_worker_requested() noexcept {
@@ -406,6 +410,36 @@ bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::micr
 
 void wait_for_frame_worker_private(FrameWorkerPhase phase) noexcept {
   constexpr auto kWaitServiceInterval = std::chrono::milliseconds(1);
+#if AURORA_WEB_RENDER_THREAD
+  // [eggy] On the browser main thread a condition-variable wait spins a core at full speed; the
+  // producer suspends under JSPI instead, a millisecond at a time, and keeps servicing the guest's
+  // timing between slices exactly as the spinning wait does.
+  for (;;) {
+    if (frame_worker_phase_reached(phase)) {
+      return;
+    }
+    {
+      std::lock_guard lock(g_frameWorker.mutex);
+      if (!g_frameWorker.started || g_frameWorker.threadId == std::this_thread::get_id()) {
+        return;
+      }
+    }
+    const int32_t seen = __atomic_load_n(&g_webPhaseWord, __ATOMIC_ACQUIRE);
+    if (frame_worker_phase_reached(phase)) {
+      return;
+    }
+    if (!aurora_web_wait_changed(&g_webPhaseWord, seen,
+                                 static_cast<uint32_t>(std::chrono::microseconds(kWaitServiceInterval).count()))) {
+      break; // not the main thread, or suspending is off: the spinning wait below
+    }
+    if (frame_worker_phase_reached(phase)) {
+      return;
+    }
+    if (const auto callback = g_frameWorkerWaitCallback.load(std::memory_order_acquire)) {
+      callback();
+    }
+  }
+#endif
   while (!wait_for_frame_worker_private_for(phase, kWaitServiceInterval)) {
   }
 }
@@ -1931,6 +1965,7 @@ void web_prepare() noexcept {
     g_frameWorker.ready.store(true, std::memory_order_release);
   }
   g_frameWorker.cv.notify_all();
+  aurora_web_notify(&g_webPhaseWord);
   record_frame_telemetry();
   webgpu::render_thread::note_cycle(micros_since(started), false);
 }

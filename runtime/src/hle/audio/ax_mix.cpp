@@ -28,6 +28,27 @@
 #include <string>
 #include <thread>
 
+#if defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+// [eggy] The pthreads browser build (EGGY.md, "The render thread"): the mix worker's runtime
+// switch, and a join that suspends the browser main thread instead of spinning it.
+#include <aurora/web_render_thread.h>
+#include <emscripten/em_js.h>
+
+// Whether the page wants the AX mix on a worker: Module.mkwAxWorker === false or ?axWorker=0 mixes
+// on the guest's thread.
+EM_JS(int, mkw_ax_worker_wanted, (), {
+  if (Module['mkwAxWorker'] === false) return 0;
+  try {
+    if (/[?&]axWorker=0(&|$)/.test(location.search)) return 0;
+  } catch (e) {
+  }
+  return 1;
+});
+#define MKW_AX_WEB_WORKER 1
+#else
+#define MKW_AX_WEB_WORKER 0
+#endif
+
 namespace AxDspHle {
 namespace {
 
@@ -114,8 +135,28 @@ public:
 
     void JoinMix() {
         if (m_mixThread.joinable()) {
+#if MKW_AX_WEB_WORKER
+            // [eggy] On the browser main thread the condition variable below spins; suspend in
+            // slices until the worker reports idle (aurora_web_wait_changed falls back to it).
+            for (;;) {
+                int32_t seen;
+                {
+                    std::lock_guard<std::mutex> lock(m_mixMutex);
+                    if (!m_mixPending && !m_mixBusy) {
+                        break;
+                    }
+                    seen = __atomic_load_n(&m_mixIdleWord, __ATOMIC_ACQUIRE);
+                }
+                if (!aurora_web_wait_changed(&m_mixIdleWord, seen, 2000)) {
+                    std::unique_lock<std::mutex> lock(m_mixMutex);
+                    m_mixIdle.wait(lock, [this] { return !m_mixPending && !m_mixBusy; });
+                    break;
+                }
+            }
+#else
             std::unique_lock<std::mutex> lock(m_mixMutex);
             m_mixIdle.wait(lock, [this] { return !m_mixPending && !m_mixBusy; });
+#endif
         }
         PublishAuxOutputs();
     }
@@ -1339,8 +1380,21 @@ private:
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
         // Single-threaded browser build: always mix inline on the guest thread.
         // [eggy] A pthreads browser build (the render thread's) mixes on a worker like the native
-        // builds, off the guest's thread.
+        // builds, off the guest's thread, unless the page turned it off.
         return false;
+#endif
+#if MKW_AX_WEB_WORKER
+        static const bool webWanted = [] {
+            const bool wanted = mkw_ax_worker_wanted() != 0;
+            if (!wanted) {
+                RT_LOGF(RT_TAG_AUDIO, "AX mix worker off (the page turned it off): mixing on the guest's thread\n");
+                std::fflush(stderr);
+            }
+            return wanted;
+        }();
+        if (!webWanted) {
+            return false;
+        }
 #endif
         if (m_mixThread.joinable()) {
             return true;
@@ -1389,6 +1443,9 @@ private:
                 m_mixBusy = false;
             }
             m_mixIdle.notify_all();
+#if MKW_AX_WEB_WORKER
+            aurora_web_notify(&m_mixIdleWord);
+#endif
         }
     }
 
@@ -1430,6 +1487,9 @@ private:
     bool m_mixStop = false;
     bool m_mixPending = false;
     bool m_mixBusy = false;
+#if MKW_AX_WEB_WORKER
+    int32_t m_mixIdleWord = 0;  // [eggy] bumped when the worker goes idle (JoinMix's suspend)
+#endif
     bool m_mixWorkerEnabled = false;
     AXCommandLayout m_mixLayout = AXCommandLayout::New;
     uint32_t m_mixCmdListSize = 0;

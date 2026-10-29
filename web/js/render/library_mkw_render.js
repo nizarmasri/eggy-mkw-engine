@@ -185,6 +185,16 @@ addToLibrary({
     },
   },
 
+  // The browser main thread's wait without spinning (web_render_thread.cpp
+  // aurora_web_wait_changed): the guest's wasm suspends until the word changes (a notify from any
+  // thread wakes it) or the timeout passes. A word that already changed answers at once.
+  mkw_wait_changed_async__async: true,
+  mkw_wait_changed_async__sig: 'ipid',
+  mkw_wait_changed_async: (word, seen, timeoutMs) => {
+    var r = Atomics.waitAsync(HEAP32, word >>> 2, seen, timeoutMs);
+    return r.async ? r.value.then(() => 1) : 1;
+  },
+
   // On the calling thread, from its event loop: an asynchronous call finished (ok) or was
   // cancelled (web_render_thread.cpp mkw_render_run_js_async).
   mkw_render_async_done_js__deps: ['$MkwRender'],

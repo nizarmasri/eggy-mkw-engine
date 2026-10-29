@@ -87,6 +87,20 @@ EM_JS(int, aurora_web_render_thread_wanted, (const char* selectorPtr), {
   return 1;
 });
 
+// Whether the main thread's waits suspend under JSPI: 1 yes, 0 the page turned it off
+// (Module.mkwSuspendWaits === false, ?suspendWaits=0), -1 no Atomics.waitAsync.
+EM_JS(int, aurora_web_suspend_waits_wanted, (), {
+  if (typeof Atomics == 'undefined' || typeof Atomics.waitAsync != 'function') return -1;
+  if (Module['mkwSuspendWaits'] === false) return 0;
+  try {
+    if (/[?&]suspendWaits=0(&|$)/.test(location.search)) return 0;
+  } catch (e) {
+  }
+  return 1;
+});
+
+extern "C" int mkw_wait_changed_async(int32_t* word, int32_t seen, double timeoutMs);
+
 namespace aurora::webgpu::render_thread {
 
 bool start() noexcept {
@@ -284,6 +298,29 @@ EMSCRIPTEN_KEEPALIVE int mkw_render_run_js_async(int index, int nargs, const voi
 
 bool aurora_render_thread_active(void) { return aurora::webgpu::render_thread::active(); }
 
+bool aurora_web_wait_changed(int32_t* word, int32_t seen, uint32_t timeoutMicros) {
+  if (!emscripten_is_main_browser_thread()) {
+    return false;
+  }
+  static const int wanted = [] {
+    const int w = aurora_web_suspend_waits_wanted();
+    aurora::webgpu::render_thread::Log.info("Main-thread waits {}", w > 0 ? "suspend under JSPI"
+                                                                     : w == 0 ? "spin (the page turned suspending off)"
+                                                                              : "spin (no Atomics.waitAsync)");
+    return w;
+  }();
+  if (wanted <= 0) {
+    return false;
+  }
+  mkw_wait_changed_async(word, seen, static_cast<double>(timeoutMicros) / 1000.0);
+  return true;
+}
+
+void aurora_web_notify(int32_t* word) {
+  __atomic_fetch_add(word, 1, __ATOMIC_SEQ_CST);
+  emscripten_futex_wake(word, INT32_MAX);
+}
+
 void aurora_render_thread_stats(AuroraRenderThreadStats* out) {
   using namespace aurora::webgpu::render_thread;
   if (out == nullptr) {
@@ -315,6 +352,8 @@ void lock_serviced(std::recursive_mutex& mutex) noexcept { mutex.lock(); }
 
 extern "C" {
 bool aurora_render_thread_active(void) { return false; }
+bool aurora_web_wait_changed(int32_t*, int32_t, uint32_t) { return false; }
+void aurora_web_notify(int32_t* word) { __atomic_fetch_add(word, 1, __ATOMIC_SEQ_CST); }
 void aurora_render_thread_stats(AuroraRenderThreadStats* out) {
   if (out != nullptr) {
     *out = AuroraRenderThreadStats{};

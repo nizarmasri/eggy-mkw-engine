@@ -35,6 +35,18 @@ typedef struct AuroraRenderThreadStats {
 
 // True once the render thread owns the canvas and WebGPU.
 bool aurora_render_thread_active(void);
+
+// Waiting on the browser main thread without spinning (pthreads builds; EGGY.md, "The render
+// thread"). The main thread cannot block in Atomics.wait, so a C++ wait there spins a core at
+// full speed; under JSPI it can suspend instead. aurora_web_wait_changed suspends the calling
+// guest until *word no longer holds `seen` (aurora_web_notify) or `timeoutMicros` pass, and
+// returns true. It returns false at once, and the caller waits its usual way, off the main
+// thread, outside a pthreads build, without Atomics.waitAsync, or when the page turned it off
+// (Module.mkwSuspendWaits = false, ?suspendWaits=0). Only call it where the guest may suspend
+// (its own code, under the JSPI exports) and with no lock held that the page's callbacks take.
+bool aurora_web_wait_changed(int32_t* word, int32_t seen, uint32_t timeoutMicros);
+// Adds one to *word and wakes every waiter (any thread).
+void aurora_web_notify(int32_t* word);
 // Monotonic counters since start; zero when inactive.
 void aurora_render_thread_stats(AuroraRenderThreadStats* out);
 

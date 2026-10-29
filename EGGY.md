@@ -331,9 +331,36 @@ and synchronous readbacks wait for DONE). The render thread takes the renderer l
 of a cycle serving the proxied calls while it waits (`servicedWaits` counts it; it should stay
 0). Proxied calls use their own queue, so serving them never runs a nested job.
 
-**Turning it off.** `?renderThread=0` or `Module.mkwRenderThread = false` before the module
-starts draws on the guest's thread as before (same build); so does a browser without
-`transferControlToOffscreen`. `MKW_WEB_RENDER_THREAD=0 web/build.sh` builds the single-threaded
+**Waiting without spinning.** The browser main thread cannot block in `Atomics.wait`, so every
+C++ wait there (a condition variable, a mutex) spins a core at full speed, which on a phone held
+at a capped clock is only heat. The guest's two waits on other threads suspend under JSPI
+instead (`aurora_web_wait_changed`, an `Atomics.waitAsync` on a word the other thread bumps with
+`aurora_web_notify`): the frame worker's SEALED/DONE (`wait_for_frame_worker_private`, a
+millisecond at a time, servicing the guest's timing between slices as the spinning wait does)
+and the AX mix join (`JoinMix`). Neither holds a lock the page's callbacks take.
+
+**Runtime switches** (read once when the module starts; the same build either way):
+
+| Switch | Page | Query | Default |
+|---|---|---|---|
+| The render thread | `Module.mkwRenderThread = false` | `?renderThread=0` | on |
+| The AX mix worker | `Module.mkwAxWorker = false` | `?axWorker=0` | on |
+| Main-thread waits suspend | `Module.mkwSuspendWaits = false` | `?suspendWaits=0` | on |
+
+Off, each does what the build did before: draw on the guest's thread, mix on the guest's thread,
+spin while waiting. A browser without `transferControlToOffscreen` gets no render thread, and one
+without `Atomics.waitAsync` spins.
+
+**Not done: decoding N+1 while N encodes.** SEALED could be published right after seal and
+prepare (aurora's native worker does that while it interpolates), so the guest's first decode of
+the next frame would not wait for the encode, submit and present. It is not safe as aurora
+stands: the encode ends in `efb_ram::encode_async_downloads`, whose closing `cancel()` clears the
+producer's EFB-to-RAM request lists (`g_pending`, `g_downloads`, `g_asyncPending`), which the
+guest fills while it decodes; overlapped, that is a data race on those vectors and lost
+readbacks (MKW's lens-flare probes use them). The request lists would have to become per frame
+first. And WebGPU calls the guest proxies during the encode would still wait for it, unless the
+render thread served them mid-encode. On a phone the guest's logic before its next decode (8-11
+ms) already covers a 2 ms cycle; `sealWaitMs` says whether it does. `MKW_WEB_RENDER_THREAD=0 web/build.sh` builds the single-threaded
 module of before. The pthreads module needs the page cross-origin isolated (SharedArrayBuffer),
 which Eggy always is; it compiles aurora and its libraries from source with `-pthread`.
 
