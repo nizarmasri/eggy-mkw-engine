@@ -276,6 +276,26 @@ inline uint16_t ByteSwap16(uint16_t value) {
     return __builtin_bswap16(value);
 }
 
+#if defined(__EMSCRIPTEN__)
+// WebAssembly has no byte swap: LLVM expands bswap32 into four shifts, two masks and three ors,
+// and bswap64 into about twenty operations, on every guest load and store. Two rotates and two
+// masks do the 32-bit one. The empty asm hides the rotate from LLVM's idiom matcher, which would
+// otherwise rebuild the bswap (and its expansion) from this very pattern.
+inline uint32_t ByteSwap32(uint32_t value) {
+    uint32_t left = __builtin_rotateleft32(value, 8);
+    __asm__("" : "+r"(left));
+    return (left & 0x00FF00FFu) | (__builtin_rotateright32(value, 8) & 0xFF00FF00u);
+}
+
+// Bytes swapped within each 16-bit half, halves within each 32-bit word, then the words.
+inline uint64_t ByteSwap64(uint64_t value) {
+    uint64_t v = ((value & 0x00FF00FF00FF00FFull) << 8) | ((value >> 8) & 0x00FF00FF00FF00FFull);
+    __asm__("" : "+r"(v));
+    v = ((v & 0x0000FFFF0000FFFFull) << 16) | ((v >> 16) & 0x0000FFFF0000FFFFull);
+    __asm__("" : "+r"(v));
+    return __builtin_rotateleft64(v, 32);
+}
+#else
 inline uint32_t ByteSwap32(uint32_t value) {
     return __builtin_bswap32(value);
 }
@@ -283,6 +303,7 @@ inline uint32_t ByteSwap32(uint32_t value) {
 inline uint64_t ByteSwap64(uint64_t value) {
     return __builtin_bswap64(value);
 }
+#endif
 
 template <typename T>
 inline T MaybeByteSwap(T value) {
