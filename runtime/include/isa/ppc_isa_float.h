@@ -198,7 +198,14 @@ inline float PpcForceSingleValueInline(double value)
     // flush into a branchless mask: a set compare lane keeps just the sign bit, a clear lane
     // passes the value to the double->float conversion. DAZ/FZ (set exactly when NI is) makes
     // the compare itself treat a subnormal as zero, matching the mask's answer.
-#if defined(MKW_HOST_X86_SIMD)
+#if defined(__EMSCRIPTEN__)
+    // [Eggy] WebAssembly: the same flush in scalar f64 ops (abs, compare, select). Emscripten's
+    // SSE headers turn the _sd forms below into lane splats, shuffles and an extract around the
+    // one compare, on the hottest path of single-precision game code. Same bits for every input:
+    // a NaN compares false and passes through, a flushed value keeps only its sign.
+    const double kept = __builtin_fabs(value) < g_mkwNiFlushThreshold ? __builtin_copysign(0.0, value) : value;
+    return static_cast<float>(kept);
+#elif defined(MKW_HOST_X86_SIMD)
     const __m128d v = _mm_set_sd(value);
     const __m128d signMask = _mm_set_sd(-0.0);
     const __m128d magnitude = _mm_andnot_pd(signMask, v);
@@ -261,7 +268,9 @@ inline double PpcForce25BitInline(double value)
     }
     else
     {
-        integral = (integral & 0xFFFFFFFFF8000000ULL) + (integral & 0x8000000ULL);
+        // Round to nearest at bit 27, ties away: the same bits as
+        // (integral & 0xFFFFFFFFF8000000) + (integral & 0x8000000), one operation fewer.
+        integral = (integral + 0x8000000ULL) & 0xFFFFFFFFF0000000ULL;
     }
 
     return PpcBitCastToDoubleInline(integral);
