@@ -439,6 +439,15 @@ inline bool TryDispatchRawCpuTarget(const RawDispatchRecord* record, CpuContext*
     if (!record || !record->entry) {
         return false;
     }
+    // The common bctrl: a translated target that needs neither register guard, called from its
+    // own context. Same call as below without building the two guard objects (about 250 bytes
+    // of stack frame) whose constructors and destructors would do nothing.
+    if (!record->preserveNonvolatileGprs && record->nonvolatileFprWriteMask == 0 &&
+        TryGetCpuContext() == cpu) [[likely]] {
+        RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
+        record->entry(cpu);
+        return true;
+    }
     RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
     PpcNonvolatileGprGuard gprGuard(cpu, record->preserveNonvolatileGprs);
     PpcNonvolatileFprGuard fprGuard(cpu, record->nonvolatileFprWriteMask);
