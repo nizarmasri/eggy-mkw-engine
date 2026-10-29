@@ -8,7 +8,16 @@
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/metalfx.hpp"
+#include "webgpu/web_render_thread.hpp"
 #include <webgpu/webgpu_cpp.h>
+#endif
+
+// [eggy] The browser render thread (lib/webgpu/web_render_thread.cpp): a pthreads web build runs
+// the frame worker on it.
+#if defined(AURORA_ENABLE_GX) && defined(__EMSCRIPTEN__) && defined(__EMSCRIPTEN_PTHREADS__)
+#define AURORA_WEB_RENDER_THREAD 1
+#else
+#define AURORA_WEB_RENDER_THREAD 0
 #endif
 
 #include "input.hpp"
@@ -268,14 +277,21 @@ struct FrameWorkerState {
 
 FrameWorkerState g_frameWorker;
 
-bool frame_worker_requested() noexcept {
-#ifdef AURORA_ENABLE_GX
-  static const bool enabled = [] {
-#if defined(__EMSCRIPTEN__)
-    // The browser build has no threads (no -pthread): frames are prepared, submitted and
-    // presented on the calling thread.
-    return false;
+#if AURORA_WEB_RENDER_THREAD
+// [eggy] The render thread's cycle presented its frame and waits for the producer's begin_frame
+// before it prepares the next one (guarded by g_frameWorker.mutex). See web_cycle_job.
+bool g_webCycleDone = false;
 #endif
+
+bool frame_worker_requested() noexcept {
+#if defined(AURORA_ENABLE_GX) && defined(__EMSCRIPTEN__)
+  // [eggy] The browser: a pthreads build whose render thread took the canvas runs the frame
+  // worker there (lib/webgpu/web_render_thread.cpp, AURORA_WEB_RENDER_THREAD above); otherwise
+  // frames are prepared, submitted and presented on the calling thread. Decided once, before the
+  // first frame (webgpu::initialize starts the render thread).
+  return webgpu::render_thread::active();
+#elif defined(AURORA_ENABLE_GX)
+  static const bool enabled = [] {
 #if defined(__APPLE__)
     // ImGui's SDL backend may raise an SDL window from ImGui::NewFrame(). On
     // macOS that reaches AppKit, whose window operations are main-thread-only;
@@ -369,8 +385,16 @@ void ensure_frame_worker_started() noexcept {
   g_frameWorker.ready.store(true, std::memory_order_release);
   g_frameWorker.prepareAllowed = false;
   g_frameWorker.started = true;
+#if AURORA_WEB_RENDER_THREAD
+  // [eggy] The worker is the browser render thread, which runs each cycle as a job and never
+  // waits in between (web_cycle_job below), so there is no thread to start here.
+  g_frameWorker.threadId = webgpu::render_thread::thread_id();
+  g_webCycleDone = false;
+  Log.info("Enabled the frame worker on the browser render thread");
+#else
   g_frameWorker.thread = std::thread(frame_worker_main);
   Log.info("Enabled bounded asynchronous frame submission worker");
+#endif
 }
 
 bool frame_worker_phase_reached(FrameWorkerPhase phase) noexcept {
@@ -1878,6 +1902,75 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
 }
 #endif
 
+#if AURORA_WEB_RENDER_THREAD
+// [eggy] The frame worker on the browser render thread (EGGY.md, "The render thread"). The native
+// worker blocks between cycles, and inside one until the producer allows the next frame's
+// preparation; a browser thread that blocks never presents its canvas or settles a promise. Here
+// a cycle is two jobs posted to the render thread, each run to completion from its event loop:
+//   web_cycle_job    (posted by end_frame): seal, encode, submit and present the frame, then
+//                    prepare the next one at once if the producer already called begin_frame;
+//   web_prepare_job  (posted by begin_frame when the cycle got there first): prepare it.
+// Preparing (begin_frame_impl: surface, staging, pass 0) publishes SEALED and DONE together, as
+// the native worker does when it does not interpolate. The producer's first GX decode of the next
+// frame waits for SEALED (fifo::drain), and sealing another frame waits for DONE (end_frame).
+gfx::SealedFrame* g_webSealedFrame = nullptr;
+
+uint64_t micros_since(PresentClock::time_point started) noexcept {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(PresentClock::now() - started).count());
+}
+
+void web_prepare() noexcept {
+  const auto started = PresentClock::now();
+  const bool prepared = begin_frame_impl(false, ImGuiFramePolicy::Immediate, nullptr);
+  {
+    std::lock_guard lock(g_frameWorker.mutex);
+    g_frameWorker.framePrepared = prepared;
+    g_webCycleDone = false;
+    g_frameWorker.sealed.store(true, std::memory_order_release);
+    g_frameWorker.ready.store(true, std::memory_order_release);
+  }
+  g_frameWorker.cv.notify_all();
+  record_frame_telemetry();
+  webgpu::render_thread::note_cycle(micros_since(started), false);
+}
+
+void web_prepare_job(void*) noexcept { web_prepare(); }
+
+void web_cycle_job(void*) noexcept {
+  const auto started = PresentClock::now();
+  webgpu::fail_if_device_lost();
+  if (g_webSealedFrame == nullptr) {
+    // Owned by the render thread for the run, so the sealed pass vector and its pooled command
+    // lists keep their capacity across frames (as frame_worker_main's local does).
+    g_webSealedFrame = new gfx::SealedFrame();
+  }
+  SealedFrameContext ctx;
+  std::vector<PresentationJob> presentationJobs;
+  {
+    webgpu::render_thread::lock_serviced(g_rendererGpuMutex);
+    std::lock_guard gpuLock(g_rendererGpuMutex, std::adopt_lock);
+    seal_frame_locked(*g_webSealedFrame, ctx);
+    presentationJobs = encode_sealed_frame(*g_webSealedFrame, ctx);
+  }
+  publish_presentations(std::move(presentationJobs), ctx.interpolationActive);
+  bool prepareNow = false;
+  {
+    std::lock_guard lock(g_frameWorker.mutex);
+    if (g_frameWorker.prepareAllowed) {
+      g_frameWorker.prepareAllowed = false;
+      prepareNow = true;
+    } else {
+      g_webCycleDone = true;
+    }
+  }
+  webgpu::render_thread::note_cycle(micros_since(started), true);
+  if (prepareNow) {
+    web_prepare();
+  }
+}
+#endif
+
 // Synchronous frame submission: seal, encode and present inline on the calling thread. Used when
 // the frame worker is disabled (RenderDoc captures) and on the boot path.
 void end_frame_impl(bool pumpEvents, bool drainFifo) {
@@ -1937,6 +2030,15 @@ bool begin_frame() noexcept {
     if (!g_frameWorker.ready.load(std::memory_order_acquire)) {
       g_frameWorker.prepareAllowed = true;
       g_frameWorker.cv.notify_one();
+#if AURORA_WEB_RENDER_THREAD
+      // [eggy] The render thread's cycle already presented and returned to its event loop: the
+      // preparation is a job of its own. Otherwise the cycle prepares as soon as it presents.
+      if (g_webCycleDone) {
+        g_webCycleDone = false;
+        g_frameWorker.prepareAllowed = false;
+        webgpu::render_thread::post(web_prepare_job, nullptr);
+      }
+#endif
       if (!waitForSurfacePreparation) {
         return true;
       }
@@ -1981,7 +2083,17 @@ void end_frame() {
   ensure_frame_worker_started();
   // DONE: this seals another frame, which means reusing the worker's encoder
   // state and its SealedFrame. The previous cycle must be completely finished.
+#if AURORA_WEB_RENDER_THREAD
+  if (!frame_worker_phase_reached(FrameWorkerPhase::Done)) {
+    // [eggy] The render thread is a whole frame behind: the only time the guest waits on it here.
+    const auto started = std::chrono::steady_clock::now();
+    wait_for_frame_worker_private(FrameWorkerPhase::Done);
+    webgpu::render_thread::note_done_wait(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
+  }
+#else
   wait_for_frame_worker_private(FrameWorkerPhase::Done);
+#endif
 
   // Seal all current GX work on the CPU while the renderer is known ready.
   // Later FIFO writes belong exclusively to the next frame.
@@ -1991,10 +2103,21 @@ void end_frame() {
     g_frameWorker.framePrepared = false;
     g_frameWorker.sealed.store(false, std::memory_order_release);
     g_frameWorker.ready.store(false, std::memory_order_release);
+#if AURORA_WEB_RENDER_THREAD
+    g_webCycleDone = false;
+#else
     g_frameWorker.jobPending = true;
+#endif
     g_frameWorker.prepareAllowed = false;
   }
+#if AURORA_WEB_RENDER_THREAD
+  // [eggy] Sealed, encoded, submitted and presented on the render thread while the guest goes on.
+  if (!webgpu::render_thread::post(web_cycle_job, nullptr)) {
+    Log.error("Could not post the frame to the render thread");
+  }
+#else
   g_frameWorker.cv.notify_one();
+#endif
 }
 } // namespace
 
@@ -2005,7 +2128,12 @@ std::chrono::nanoseconds wait_for_frame_worker_sealed() noexcept {
   }
   const auto started = std::chrono::steady_clock::now();
   wait_for_frame_worker_private(FrameWorkerPhase::Sealed);
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
+  const auto waited =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
+#if AURORA_WEB_RENDER_THREAD
+  webgpu::render_thread::note_seal_wait(static_cast<uint64_t>(waited.count() / 1000));
+#endif
+  return waited;
 }
 bool wait_for_frame_worker_for(std::chrono::microseconds timeout) noexcept {
   return wait_for_frame_worker_private_for(FrameWorkerPhase::Done, timeout);

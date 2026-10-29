@@ -79,6 +79,11 @@ Environment:
                               MKW_DISC_EXTRACT_CMD='DolphinTool extract -i {IMAGE} -o {OUT} -p DATA'
                             (paths containing spaces are fine: replacement happens after splitting)
   PYTHON                    Python 3 interpreter (default: python3)
+  MKW_WEB_RENDER_THREAD     1 (default) builds the module with pthreads and a render thread that
+                            draws on a second core (EGGY.md); it needs SharedArrayBuffer, so the
+                            site must be served cross-origin isolated (COOP: same-origin, COEP:
+                            require-corp), and it compiles aurora and its libraries from source
+                            (<build-dir>/wasm-mt). 0 builds the single-threaded module.
 USAGE
 }
 
@@ -483,6 +488,14 @@ translator "${shard_args[@]}"
 # (d) Emscripten configure + build
 # ---------------------------------------------------------------------------
 cmake_build=$build_dir/wasm
+# [Eggy] The render thread (EGGY.md, "The render thread"): the module is built with pthreads so
+# aurora can draw on a second core. Everything then compiles with -pthread (atomics and bulk
+# memory), in its own CMake directory so switching never mixes objects of the two kinds, and the
+# prebuilt package (built without -pthread) cannot be used. MKW_WEB_RENDER_THREAD=0 builds the
+# single-threaded module of before.
+web_render_thread=${MKW_WEB_RENDER_THREAD:-1}
+case "$web_render_thread" in 0|1) ;; *) fail "MKW_WEB_RENDER_THREAD must be 0 or 1, not '$web_render_thread'" ;; esac
+if ((web_render_thread)); then cmake_build=$build_dir/wasm-mt; fi
 if [[ -f "$cmake_build/CMakeCache.txt" ]]; then
     cache_home=$(grep '^CMAKE_HOME_DIRECTORY:INTERNAL=' "$cmake_build/CMakeCache.txt" | cut -d= -f2- || true)
     cache_tc=$(grep '^CMAKE_TOOLCHAIN_FILE:' "$cmake_build/CMakeCache.txt" | cut -d= -f2- || true)
@@ -498,7 +511,10 @@ fi
 # from-source build by itself if it does not match.
 prebuilt_args=()
 prebuilt_archive=$workspace/web/prebuilt/web-prebuilt.tar.xz
-if [[ -f "$prebuilt_archive" && -f "$prebuilt_archive.sha256" ]]; then
+if ((web_render_thread)); then
+    info "render thread: compiling aurora and its libraries from source with -pthread (no prebuilt)"
+    prebuilt_args=(-DMKW_WEB_RENDER_THREAD=ON -DCMAKE_C_FLAGS=-pthread -DCMAKE_CXX_FLAGS=-pthread -DSDL_PTHREADS=ON)
+elif [[ -f "$prebuilt_archive" && -f "$prebuilt_archive.sha256" ]]; then
     prebuilt_sha=$(awk '{print $1}' "$prebuilt_archive.sha256")
     prebuilt_dir=$build_dir/web-prebuilt
     if [[ "$(cat "$prebuilt_dir/.archive-sha256" 2>/dev/null)" != "$prebuilt_sha" ]]; then
@@ -614,5 +630,5 @@ cat <<EOF
     Products:    $(grep -o '"id":"[A-Za-z]*"' "$out_dir/products.json" | cut -d'"' -f4 | tr '\n' ' ')
     Host:        any static server with HTTP Range support (nginx, Caddy, ...), serving .wasm as application/wasm.
                  Other devices need HTTPS for WebGPU: add --https --lan to serve.py (docs/web-hosting.md).
-    Players need Chrome/Edge 137+ (WebGPU + JSPI).
+    Players need Chrome/Edge 137+ (WebGPU + JSPI)$(if ((web_render_thread)); then echo ", served cross-origin isolated (render thread)"; fi).
 EOF

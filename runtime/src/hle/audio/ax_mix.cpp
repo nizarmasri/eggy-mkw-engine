@@ -1336,8 +1336,10 @@ private:
     }
 
     bool EnsureMixWorker() {
-#if defined(__EMSCRIPTEN__)
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
         // Single-threaded browser build: always mix inline on the guest thread.
+        // [eggy] A pthreads browser build (the render thread's) mixes on a worker like the native
+        // builds, off the guest's thread.
         return false;
 #endif
         if (m_mixThread.joinable()) {

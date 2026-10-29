@@ -1,4 +1,5 @@
 #include "gpu.hpp"
+#include "web_render_thread.hpp"
 
 #include <array>
 #include <algorithm>
@@ -538,6 +539,11 @@ static bool create_surface() {
 }
 
 bool initialize(AuroraBackend auroraBackend) {
+#ifdef __EMSCRIPTEN__
+  // [eggy] A pthreads build moves the canvas and all of WebGPU to the render thread before the
+  // first WebGPU call (web_render_thread.cpp); without threads this does nothing.
+  render_thread::start();
+#endif
   if (!g_instance) {
     Log.info("Creating WebGPU instance");
     const std::array requiredInstanceFeatures{

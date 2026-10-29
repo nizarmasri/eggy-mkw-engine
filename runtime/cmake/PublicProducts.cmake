@@ -216,6 +216,10 @@ endif()
 # native build copies beside the executable are embedded at /app (RuntimePlatform::
 # ExecutableDirectory() on the web). The aurora sqlite pipeline cache is off in the browser and
 # networking is compiled out, so neither the initial pipeline cache nor cacert.pem ships.
+# [Eggy] MKW_WEB_RENDER_THREAD: the JSPI module with pthreads and a render thread that owns the
+# canvas and WebGPU (EGGY.md, "The render thread"). Every object must be compiled with -pthread
+# (web/build.sh passes -DCMAKE_C_FLAGS=-pthread -DCMAKE_CXX_FLAGS=-pthread -DSDL_PTHREADS=ON).
+option(MKW_WEB_RENDER_THREAD "Browser build: pthreads and a render thread (EGGY.md)" OFF)
 function(mkw_configure_web_product target)
     set(web_dir "${MKW_RUNTIME_SOURCE_DIR}/../web")
     set(dsp_rom "${MKW_RUNTIME_SOURCE_DIR}/assets/dsp/dsp_coef.bin")
@@ -247,6 +251,25 @@ function(mkw_configure_web_product target)
         target_link_options(${target} PRIVATE "--js-library=${library}")
         set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${library}")
     endforeach()
+    if(MKW_WEB_RENDER_THREAD)
+        if(NOT CMAKE_C_FLAGS MATCHES "(^| )-pthread( |$)" OR NOT CMAKE_CXX_FLAGS MATCHES "(^| )-pthread( |$)")
+            message(FATAL_ERROR "MKW_WEB_RENDER_THREAD needs every object compiled with -pthread: "
+                "configure with -DCMAKE_C_FLAGS=-pthread -DCMAKE_CXX_FLAGS=-pthread (web/build.sh does)")
+        endif()
+        if(MKW_USE_WEB_PREBUILT)
+            message(FATAL_ERROR "MKW_WEB_RENDER_THREAD cannot use the prebuilt web package (built without -pthread)")
+        endif()
+        target_link_options(${target} PRIVATE
+            -pthread
+            # Workers loaded before main(): the render thread and the AX mix worker start at once
+            # instead of waiting for a worker script while the guest's thread waits on them.
+            -sPTHREAD_POOL_SIZE=3
+            # The canvas is transferred to the render thread (emscripten_pthread_attr_
+            # settransferredcanvases), and SDL's size changes reach it from the main thread.
+            -sOFFSCREENCANVAS_SUPPORT
+            "--js-library=${web_dir}/js/render/library_mkw_render.js")
+        set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${web_dir}/js/render/library_mkw_render.js")
+    endif()
     # For web/build.sh: the site assembly copies these next to index.html.
     if(MKW_PLATFORM_WEB_DIST)
         add_custom_command(TARGET ${target} POST_BUILD

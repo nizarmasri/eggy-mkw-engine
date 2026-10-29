@@ -216,6 +216,14 @@ addToLibrary({
     //   calcMs drawMs submitMs presentMs audioMs padsWaitMs yieldMs idleMs otherMs  (per frame)
     //   late20 late34 (passes over 20 / 34 ms)  drawEvery  pacing
     //   extraCalcs (catch-up calcs run)  droppedFrames (debt let go)  behindMax (frames)
+    //   picturesPerSec (pictures the guest drew a wall second)  guestDrawMs (its drawing code and
+    //   aurora's GX recording, per picture)
+    //   renderThread (a pthreads build drew on its render thread, EGGY.md)  renderThreadMs (that
+    //   thread busy per picture: seal, encode, submit, present)  renderPicturesPerSec (pictures it
+    //   presented a wall second)  proxiedCalls (WebGPU calls the guest's thread sent it, per
+    //   picture)  proxiedMs (the guest waiting on them, per picture)  sealWaitMs  doneWaitMs (the
+    //   guest waiting for the render thread before decoding / sealing a frame, per game frame)
+    //   servicedWaits (frames whose start found the renderer lock taken; should stay 0)
     perf() {
       if (!Eggy.base) return null;
       const w = Eggy.W.PERF;
@@ -244,6 +252,18 @@ addToLibrary({
       out['droppedFrames'] = Eggy.i32(w + 17);
       out['behindMax'] = Eggy.i32(w + 18);
       out['pacing'] = Eggy.i32(w + 19) === 1;
+      const drawn = out['drawn'];
+      out['picturesPerSec'] = windowUs > 0 ? (drawn * 1e6) / windowUs : 0;
+      out['guestDrawMs'] = drawn > 0 ? (out['drawMs'] * frames) / drawn : 0;
+      const cycles = Eggy.i32(w + 21);
+      out['renderThread'] = Eggy.i32(w + 20) === 1;
+      out['renderThreadMs'] = cycles > 0 ? Eggy.i32(w + 22) / cycles / 1000 : 0;
+      out['renderPicturesPerSec'] = windowUs > 0 ? (cycles * 1e6) / windowUs : 0;
+      out['proxiedCalls'] = cycles > 0 ? Eggy.i32(w + 23) / cycles : Eggy.i32(w + 23);
+      out['proxiedMs'] = cycles > 0 ? Eggy.i32(w + 24) / cycles / 1000 : 0;
+      out['sealWaitMs'] = per(Eggy.i32(w + 25));
+      out['doneWaitMs'] = per(Eggy.i32(w + 26));
+      out['servicedWaits'] = Eggy.i32(w + 27);
       out['seq'] = Eggy.i32(w);
       return out;
     },

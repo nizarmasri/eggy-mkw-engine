@@ -20,10 +20,16 @@ repository from a pinned commit of this one.
 | `runtime/src/hle/gx/gx_egg.cpp` | The `AsyncDisplay::endRender` HLE returns at once when `Eggy::SkipEndRender()`. | Race frames Eggy does not show (`renderSkip`, `drawEvery`) skip the EFB copy with the draw, so the screen keeps the last shown frame. |
 | `runtime/src/hle/vi.cpp`, `runtime/src/hle/audio/audio.cpp` | `Eggy::Perf::Scope` timers (marked `// [eggy]`) around aurora's frame end/begin, the browser yield, the wait for the retrace boundary, the idle sleeps and the audio mixer. | Race API 2's `perf()` breakdown. They count only in Eggy mode during a race or its results; otherwise one branch. |
 | `web/build.sh` | `MKW_CMAKE_ARGS` is added to the configure, and `MKW_PRECOMPRESS_ARGS` to `precompress_dist.py`; both are unset by default. | Eggy's CI caches compiles that use the precompiled headers through ccache (it passes a project include with `-Xclang -fno-pch-timestamp`), and skips the brotli copy of the wasm, which its pack never reads. |
+| `aurora-main/lib/aurora.cpp` | Under `AURORA_WEB_RENDER_THREAD` (a pthreads browser build): the frame worker runs on the render thread as two event-loop jobs (`web_cycle_job`, `web_prepare_job`) instead of a blocking `std::thread`; `end_frame` waits for DONE only when the render thread is a whole frame behind, and counts the guest's waits. | The render thread (below). Native builds are unchanged. |
+| `aurora-main/lib/webgpu/gpu.cpp`, `aurora-main/cmake/aurora_core.cmake`, `aurora-main/CMakeLists.txt` | `webgpu::initialize` starts the render thread before the first WebGPU call; `web_render_thread.cpp` is compiled in (a no-op without pthreads); a comment. | The render thread. |
+| `runtime/src/hle/audio/ax_mix.cpp` | `EnsureMixWorker` mixes on its own thread in a pthreads browser build, as natively. | Takes the AX mix off the guest's thread. |
+| `runtime/cmake/PublicProducts.cmake`, `web/build.sh` | `MKW_WEB_RENDER_THREAD` (on by default in `build.sh`): every object compiled with `-pthread`, linked with `-sPTHREAD_POOL_SIZE=3 -sOFFSCREENCANVAS_SUPPORT` and `web/js/render/library_mkw_render.js`, in `<build>/wasm-mt`, without the prebuilt package. `MKW_WEB_RENDER_THREAD=0` builds the single-threaded module. | The render thread. |
 
 ## Added
 
 - `.github/workflows/eggy.yml`: the web disc test on every push (Node, JSPI, no game data).
+- `aurora-main/include/aurora/web_render_thread.h`, `aurora-main/lib/webgpu/web_render_thread.{hpp,cpp}`,
+  `web/js/render/library_mkw_render.js`, `web/tests/render_thread/`: the render thread (below).
 - `runtime/src/eggy/eggy.cpp`, `runtime/include/eggy/eggy.h`, `web/js/library_eggy.js`,
   `web/site/eggy.html`, `web/site/eggy/eggy-engine.js`, `web/site/eggy/eggy-test.js`: Eggy's
   host API (below). Hooks on 0x80009984, 0x80009988, 0x805302C4 and 0x8051AF84, and on the
@@ -278,3 +284,64 @@ prebuilt fingerprint.
   - the shell-targeting hook (no shells were thrown);
   - team and battle sections with 2+ humans;
   - a cross-port hash comparison with 4 humans.
+
+## The render thread (2026-10-29)
+
+On a phone the browser main thread runs everything: the game's logic and drawing code, aurora's
+GX decoding, then sealing, encoding, submitting and presenting the frame through WebGPU's JS
+bindings, and the AX mixer. The phone holds that one core near 2 GHz with three or four others
+idle. The build (`MKW_WEB_RENDER_THREAD=1`, `web/build.sh`'s default) is now a pthreads module,
+and the drawing work that does not need the guest moves to a second core.
+
+**What moves.** aurora starts a render thread (`aurora-main/lib/webgpu/web_render_thread.cpp`)
+before its first WebGPU call. The canvas is transferred to it as an OffscreenCanvas
+(`emscripten_pthread_attr_settransferredcanvases`, `-sOFFSCREENCANVAS_SUPPORT`), and every
+WebGPU object is created there. aurora's frame worker, which natively is a thread that seals,
+encodes, submits and presents frame N while the producer records N+1 (the SEALED and DONE
+phases in `aurora.cpp`), runs on it as two jobs posted to its event loop: `web_cycle_job`
+(posted by `aurora_end_frame`: seal, encode, submit, present) and `web_prepare_job` (the next
+frame's surface, staging buffers and pass 0). A browser thread that blocks never presents its
+canvas or settles a promise, so the render thread never waits between jobs; it returns to its
+event loop after each. The AX mixer runs on its own worker too (`ax_mix.cpp`, as natively).
+
+**What stays.** The guest's thread still runs the game's code and decodes the GX FIFO into
+aurora's command lists (most of a picture's cost on the phone: about three quarters of the
+draw hook is the game's own code and aurora's GX decoding). WebGPU calls it makes while
+decoding (texture, bind group and pipeline cache misses) and during startup run on the render
+thread while it waits: `web/js/render/library_mkw_render.js` decorates every emdawnwebgpu
+import so that, called anywhere but the render thread, it serializes its arguments and
+`mkw_render_run_js` proxies it there (a promise-returning one, `emwgpuWaitAny`, keeps the caller
+waiting until it settles). The guest waits for the render thread in two places only: before
+the first GX decode of a frame until the previous frame is sealed and the next prepared
+(`sealWaitMs`), and before sealing a frame while the render thread is still a whole frame
+behind (`doneWaitMs`). At most one frame is in flight. Game state never depends on the render
+thread: it only reads the sealed command lists, and the race hash covers none of it.
+
+**Deadlocks.** A worker blocked on a futex runs nothing proxied to it, so a thread holding a
+lock the render thread wants must not be waiting for a WebGPU call. The frame protocol keeps
+the guest out of the renderer lock while a job runs (decoding waits for SEALED, staging splits
+and synchronous readbacks wait for DONE). The render thread takes the renderer lock at the start
+of a cycle serving the proxied calls while it waits (`servicedWaits` counts it; it should stay
+0). Proxied calls use their own queue, so serving them never runs a nested job.
+
+**Turning it off.** `?renderThread=0` or `Module.mkwRenderThread = false` before the module
+starts draws on the guest's thread as before (same build); so does a browser without
+`transferControlToOffscreen`. `MKW_WEB_RENDER_THREAD=0 web/build.sh` builds the single-threaded
+module of before. The pthreads module needs the page cross-origin isolated (SharedArrayBuffer),
+which Eggy always is; it compiles aurora and its libraries from source with `-pthread`.
+
+**perf() fields** (`web/js/library_eggy.js`, shared words 500-507): `picturesPerSec` (pictures
+the guest drew per wall second), `guestDrawMs` (its drawing code and GX decoding per picture),
+`renderThread` (true when the render thread draws), `renderThreadMs` (that thread busy per
+picture: seal, encode, submit, present, prepare), `renderPicturesPerSec`, `proxiedCalls` and
+`proxiedMs` (WebGPU calls the guest sent it per picture, and its wait for them), `sealWaitMs`
+and `doneWaitMs` (per game frame), `servicedWaits`. `submitMs` and `presentMs` keep their
+meaning: with the render thread `submitMs` is only what `aurora_end_frame`/`begin_frame` still
+cost the guest.
+
+**Testing.** `web/tests/render_thread/run.sh` builds aurora with `-pthread` and a GX program
+(`render_thread_test.cpp`: a clear, a vertex-coloured quad, a textured quad uploaded from the
+guest's thread, a depth peek each frame) and checks in headless Chromium, cross-origin
+isolated: 120 frames presented on the render thread, WebGPU calls proxied, the three colours on
+screen, and the same with `?renderThread=0`; no game data. It has no workflow yet (adding one
+needs a token with the `workflow` scope).

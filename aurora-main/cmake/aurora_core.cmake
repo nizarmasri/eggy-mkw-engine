@@ -36,6 +36,8 @@ if (AURORA_ENABLE_GX)
         target_compile_definitions(aurora_core PRIVATE ENABLE_BACKEND_WEBGPU)
     endif ()
     target_sources(aurora_core PRIVATE lib/webgpu/gpu.cpp lib/webgpu/gpu_cache.cpp lib/dawn/BackendBinding.cpp)
+    # [eggy] The browser render thread (a no-op without pthreads or outside the browser).
+    target_sources(aurora_core PRIVATE lib/webgpu/web_render_thread.cpp)
     target_link_libraries(aurora_core PRIVATE dawn::webgpu_dawn)
     if (APPLE AND DAWN_ENABLE_METAL)
         find_library(AURORA_METALFX_FRAMEWORK MetalFX)

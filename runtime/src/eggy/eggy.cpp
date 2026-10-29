@@ -32,6 +32,7 @@
 #include "music_attenuation.h"
 #include "platform/web_host.h"
 
+#include <aurora/web_render_thread.h>
 #include <dolphin/pad.h>
 
 #include <algorithm>
@@ -240,6 +241,8 @@ struct PerfWindow {
     int32_t frames = 0, passes = 0, drawn = 0, late20 = 0, late34 = 0, extra = 0, dropped = 0, behindMax = 0;
 };
 PerfWindow g_perfWin;
+// The render thread's counters (aurora/web_render_thread.h) at the start of the window.
+AuroraRenderThreadStats g_renderAtStart{};
 
 bool PerfCounting() { return g_state == kRacing || g_state == kResults; }
 
@@ -248,6 +251,7 @@ void ResetPerfWindow(SteadyClock::time_point now) {
     g_perfWin.start = now;
     g_perfWin.lastPass = now;
     g_perfNs.fill(0);
+    aurora_render_thread_stats(&g_renderAtStart);
 }
 
 void PublishPerf(SteadyClock::time_point now) {
@@ -267,6 +271,21 @@ void PublishPerf(SteadyClock::time_point now) {
     w[17] = g_perfWin.dropped;
     w[18] = g_perfWin.behindMax;
     w[19] = Mail(kPacingOff) != 0 ? 0 : 1;
+    // The render thread (EGGY.md, "The render thread"): what it did over the window, and what the
+    // guest's thread spent waiting on it.
+    AuroraRenderThreadStats rt{};
+    aurora_render_thread_stats(&rt);
+    auto delta = [](uint64_t now, uint64_t then) {
+        return static_cast<int32_t>(std::min<uint64_t>(now - then, INT32_MAX));
+    };
+    w[20] = aurora_render_thread_active() ? 1 : 0;
+    w[21] = delta(rt.cycles, g_renderAtStart.cycles);
+    w[22] = delta(rt.cycleMicros, g_renderAtStart.cycleMicros);
+    w[23] = delta(rt.proxiedCalls, g_renderAtStart.proxiedCalls);
+    w[24] = delta(rt.proxiedMicros, g_renderAtStart.proxiedMicros);
+    w[25] = delta(rt.sealWaitMicros, g_renderAtStart.sealWaitMicros);
+    w[26] = delta(rt.doneWaitMicros, g_renderAtStart.doneWaitMicros);
+    w[27] = delta(rt.servicedWaits, g_renderAtStart.servicedWaits);
     ResetPerfWindow(now);
 }
 

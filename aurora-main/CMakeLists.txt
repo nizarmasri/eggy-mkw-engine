@@ -12,7 +12,8 @@ if (EMSCRIPTEN)
   # Browser build (emcmake). Every object linked into the final module, aurora's
   # dependencies included, must use native wasm exceptions and longjmp: the JS-based
   # invoke_* trampolines would put JS frames on the stack between a JSPI promising
-  # export and a suspend point, which traps. No -pthread and no Asyncify.
+  # export and a suspend point, which traps. No Asyncify. [eggy] -pthread only for the render
+  # thread build (lib/webgpu/web_render_thread.cpp), where every object is compiled with it.
   set(CMAKE_POSITION_INDEPENDENT_CODE OFF)
   add_compile_options(-fwasm-exceptions -sSUPPORT_LONGJMP=wasm)
   add_link_options(-fwasm-exceptions -sSUPPORT_LONGJMP=wasm)
