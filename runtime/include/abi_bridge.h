@@ -4,6 +4,7 @@
 #include "system_bridge.h"
 #include "game_graphics_options.h"
 #include "runtime_log.h"
+#include "eggy/logic_switch.h"  // [Eggy] logic performance switches
 
 #include <array>
 #include <atomic>
@@ -303,7 +304,15 @@ struct KnownTypedNativeCpuCall {
 // a miss just re-runs the sorted lookup. 512 entries (12 KiB) covers the per-frame indirect
 // working set while staying L1/L2 resident, unlike 4096 which would thrash L2. Must stay a
 // power of two, the index masks with (size - 1).
+#if defined(__EMSCRIPTEN__)
+// [Eggy] WebAssembly: 4096. The slot is a function of the target's address bits 2..(2+n), so with
+// a race frame's few hundred virtual-call targets 512 slots left about one target in three sharing
+// a slot, and every collision that alternates pays a binary search over the whole registry
+// (FindRawByAddressPtrMiss was ~1% of the race's game logic). Only touched entries cost cache.
+inline constexpr size_t kIndirectDispatchCacheEntries = 4096;
+#else
 inline constexpr size_t kIndirectDispatchCacheEntries = 512;
+#endif
 
 // Namespace-scope `inline thread_local`, not function-local `static thread_local`, to avoid a
 // thread-static init epoch check on every bctrl (same as g_currentCpuContext in ppc_runtime.h).
@@ -438,6 +447,15 @@ MKW_PPC_FORCE_INLINE bool TryDispatchResolvedCpuTarget(const TranslatedFunctionI
 inline bool TryDispatchRawCpuTarget(const RawDispatchRecord* record, CpuContext* cpu) {
     if (!record || !record->entry) {
         return false;
+    }
+    // The common bctrl: a translated target that needs neither register guard, called from its
+    // own context. Same call as below without building the two guard objects (about 250 bytes
+    // of stack frame) whose constructors and destructors would do nothing.
+    if (!record->preserveNonvolatileGprs && record->nonvolatileFprWriteMask == 0 &&
+        TryGetCpuContext() == cpu && LogicSwitch::On(LogicSwitch::kIndirectFast)) [[likely]] {
+        RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
+        record->entry(cpu);
+        return true;
     }
     RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
     PpcNonvolatileGprGuard gprGuard(cpu, record->preserveNonvolatileGprs);

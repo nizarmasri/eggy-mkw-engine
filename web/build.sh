@@ -19,10 +19,11 @@ set -euo pipefail
 # Settings you may want to adjust (names of the CMake target and its outputs).
 # ---------------------------------------------------------------------------
 # CMake targets that link web products: <Target>.js (Emscripten glue) + <Target>.wasm, plus the
-# optional extras <Target>.data / <Target>.wasm.map. RetroRewind is added with --retro-rewind.
+# optional extras <Target>.data / <Target>.wasm.map / <Target>.js.symbols (the wasm function
+# names, for profiles and players' stacks). RetroRewind is added with --retro-rewind.
 BASE_TARGET=WiiCompiled
 RETRO_TARGET=RetroRewind
-WEB_EXTRA_SUFFIXES=(.data .wasm.map)
+WEB_EXTRA_SUFFIXES=(.data .wasm.map .js.symbols)
 DISC_MANIFEST_NAME=disc-manifest.json
 MODS_DIR_NAME=mods
 RETRO_MOD_DIR_NAME=RetroRewind6   # dist/mods/RetroRewind6 + dist/mods/RetroRewind6-manifest.json
