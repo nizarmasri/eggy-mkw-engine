@@ -265,7 +265,15 @@ inline void PpcWritePairPsqInline(uint32_t addr, T first, T second)
 MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr)
 {
 #if defined(__EMSCRIPTEN__)
-    return MemoryInline::ResolveRangeHost(addr, 0, 8u, true, false);
+    // [Eggy] One coarse lookup, the one Memory::Read64 (this load's own fallback) makes: a page
+    // with a readable bias serves any access of up to 8 bytes that starts in it, since memory.cpp
+    // gives that bias only to a page its successor continues in host memory. ResolveRangeHost
+    // looked up both ends on every paired load.
+    const uintptr_t encodedBias =
+        MemoryInline::g_fullReadablePageBias[addr >> MemoryInline::kPageShift];
+    if (encodedBias == 0) [[unlikely]]
+        return nullptr;
+    return reinterpret_cast<const uint8_t*>((encodedBias - 1u) + addr);
 #endif
     if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
         return nullptr;
@@ -282,7 +290,15 @@ MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr
 MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)
 {
 #if defined(__EMSCRIPTEN__)
-    return MemoryInline::ResolveRangeHost(addr, 0, 8u, false, true);
+    // [Eggy] One coarse lookup when the 8 bytes stay in one 1 MiB page (a wrapped address
+    // crosses too); a crossing store takes Memory::Write64, which checks both pages' guards.
+    if (((addr + 7u) >> MemoryInline::kPageShift) != (addr >> MemoryInline::kPageShift)) [[unlikely]]
+        return nullptr;
+    const uintptr_t encodedBias =
+        MemoryInline::g_fullWritablePageBias[addr >> MemoryInline::kPageShift];
+    if (encodedBias == 0) [[unlikely]]
+        return nullptr;
+    return reinterpret_cast<uint8_t*>((encodedBias - 1u) + addr);
 #endif
     if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
         return nullptr;
