@@ -352,3 +352,38 @@ guest's thread, a depth peek each frame) and checks in headless Chromium, cross-
 isolated: 120 frames presented on the render thread, WebGPU calls proxied, the three colours on
 screen, and the same with `?renderThread=0`; no game data. It has no workflow yet (adding one
 needs a token with the `workflow` scope).
+
+**Status (2026-10-29, CI: headless Chromium, 2-core runner, SwiftShader WebGPU).**
+- engine-5cc24f7 (built as `variant=baton` for the ccache; a JSPI engine) never got an adapter:
+  the main thread blocked on the render thread's `requestAdapter`, which needs a main-thread task
+  (above). engine-440bff3 waits asynchronously and starts.
+- engine-440bff3, `humans=1&finishAll=1500&drawEvery=2&results=10` (smoke 40906778825): the render
+  thread takes the canvas, report hash 2276745402 at frame 1500 (the same as engine-4906146 at
+  `skip=0` and the baton build), results 10.1 s, 57-60 game frames/s once warm, `servicedWaits` 0.
+- `?renderThread=0` on engine-5cc24f7, 2 humans (smoke 40899498752): report at frame 1500, AX on
+  its worker.
+- smoke-ab 40906790387, engine-4906146 against engine-440bff3, `skip=0&drawEvery=1`, two rounds
+  each, same hash every run. Per game frame, the averages of both rounds:
+
+  | | 4906146 | 440bff3 |
+  |---|---|---|
+  | race wall, game frames/s | 6.5-6.7 | 4.3-4.4 |
+  | calcMs | 11.8-12.0 | 11.6-11.9 |
+  | drawMs (guest) | 3.3-3.5 | 3.6-4.8 |
+  | submitMs (guest) | 115-121 | 0.15 |
+  | audioMs | 2.6-2.7 | 20.8-21.3 |
+  | render thread per picture | (on the main thread, ~400 in submit) | 838 |
+  | sealWaitMs | - | 198 |
+
+  `-pthread` costs the game's logic nothing measurable. On this runner the render thread is the
+  limit: SwiftShader's work takes about twice as long there (the GPU process, the render thread
+  and a main thread that spins while it waits share two cores), and the guest waits for each
+  picture before decoding the next. The AX mix worker loses on two cores for the same reason (the
+  main thread spins on the join while the worker waits for a core). A phone has real GPU work and
+  idle cores, so these numbers say little about it; the phone is the test.
+- Next, if the phone wants more: the main thread's waits for the render thread (SEALED, DONE) and
+  for the mix should suspend under JSPI instead of spinning (a free core for the other threads,
+  and less heat on a phone); SEALED can be published right after seal and prepare, so the guest
+  decodes the next frame while the render thread encodes (aurora does this natively while it
+  interpolates); the mix worker can be turned off on the web if the phone's `audioMs` does not
+  drop.
