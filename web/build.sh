@@ -83,7 +83,7 @@ Environment:
                             draws on a second core (EGGY.md); it needs SharedArrayBuffer, so the
                             site must be served cross-origin isolated (COOP: same-origin, COEP:
                             require-corp), and it compiles aurora and its libraries from source
-                            (<build-dir>/wasm-mt). 0 builds the single-threaded module.
+                            (<build-dir>/wasm-baton). 0 builds the single-threaded module.
 USAGE
 }
 
@@ -492,10 +492,12 @@ cmake_build=$build_dir/wasm
 # aurora can draw on a second core. Everything then compiles with -pthread (atomics and bulk
 # memory), in its own CMake directory so switching never mixes objects of the two kinds, and the
 # prebuilt package (built without -pthread) cannot be used. MKW_WEB_RENDER_THREAD=0 builds the
-# single-threaded module of before.
+# single-threaded module of before. The directory is the one the ios26 branch's baton build uses:
+# both compile every object with the same flags (they differ only in how they link), so a
+# compiler cache keyed on the command line (Eggy's CI) serves one build with the other's objects.
 web_render_thread=${MKW_WEB_RENDER_THREAD:-1}
 case "$web_render_thread" in 0|1) ;; *) fail "MKW_WEB_RENDER_THREAD must be 0 or 1, not '$web_render_thread'" ;; esac
-if ((web_render_thread)); then cmake_build=$build_dir/wasm-mt; fi
+if ((web_render_thread)); then cmake_build=$build_dir/wasm-baton; fi
 if [[ -f "$cmake_build/CMakeCache.txt" ]]; then
     cache_home=$(grep '^CMAKE_HOME_DIRECTORY:INTERNAL=' "$cmake_build/CMakeCache.txt" | cut -d= -f2- || true)
     cache_tc=$(grep '^CMAKE_TOOLCHAIN_FILE:' "$cmake_build/CMakeCache.txt" | cut -d= -f2- || true)
