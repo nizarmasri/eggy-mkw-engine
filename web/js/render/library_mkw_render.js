@@ -147,6 +147,8 @@ addToLibrary({
 
   // On the render thread: the proxied call (web_render_thread.cpp mkw_render_run_js).
   mkw_render_receive_js__deps: ['$MkwRender', 'mkw_render_js_done'],
+  // Pointers as 'p', so they arrive unsigned (the module may address up to 4 GB).
+  mkw_render_receive_js__sig: 'viippp',
   mkw_render_receive_js: (index, nargs, buf, result, call) => {
     var args = [];
     for (var i = 0; i < nargs; i++) {

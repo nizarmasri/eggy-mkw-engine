@@ -116,6 +116,10 @@ bool start() noexcept {
   }
   pthread_attr_t attr;
   pthread_attr_init(&attr);
+  // Emscripten gives a pthread 64 KiB of stack, and a wasm stack overflow corrupts the heap
+  // silently. The render thread runs what a native frame worker runs on a full-size stack
+  // (pipeline and shader building, ImGui, the surface): give it as much as one.
+  pthread_attr_setstacksize(&attr, 4 * 1024 * 1024);
   emscripten_pthread_attr_settransferredcanvases(&attr, selector);
   pthread_t thread = 0;
   const int rc = pthread_create(&thread, &attr, thread_main, nullptr);

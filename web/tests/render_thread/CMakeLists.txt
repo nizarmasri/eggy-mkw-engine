@@ -31,6 +31,6 @@ target_compile_options(render_thread_test PRIVATE -fwasm-exceptions -sSUPPORT_LO
 target_link_options(render_thread_test PRIVATE
   -fwasm-exceptions -sSUPPORT_LONGJMP=wasm
   -sJSPI -sALLOW_MEMORY_GROWTH=1
-  -pthread -sPTHREAD_POOL_SIZE=2 -sOFFSCREENCANVAS_SUPPORT
+  -pthread -sPTHREAD_POOL_SIZE=2 -sDEFAULT_PTHREAD_STACK_SIZE=1MB -sOFFSCREENCANVAS_SUPPORT
   "--js-library=${repo}/web/js/render/library_mkw_render.js")
 set_property(TARGET render_thread_test APPEND PROPERTY LINK_DEPENDS "${repo}/web/js/render/library_mkw_render.js")

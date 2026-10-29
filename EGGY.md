@@ -23,7 +23,7 @@ repository from a pinned commit of this one.
 | `aurora-main/lib/aurora.cpp` | Under `AURORA_WEB_RENDER_THREAD` (a pthreads browser build): the frame worker runs on the render thread as two event-loop jobs (`web_cycle_job`, `web_prepare_job`) instead of a blocking `std::thread`; `end_frame` waits for DONE only when the render thread is a whole frame behind, and counts the guest's waits. | The render thread (below). Native builds are unchanged. |
 | `aurora-main/lib/webgpu/gpu.cpp`, `aurora-main/cmake/aurora_core.cmake`, `aurora-main/CMakeLists.txt` | `webgpu::initialize` starts the render thread before the first WebGPU call; `web_render_thread.cpp` is compiled in (a no-op without pthreads); a comment. | The render thread. |
 | `runtime/src/hle/audio/ax_mix.cpp` | `EnsureMixWorker` mixes on its own thread in a pthreads browser build, as natively. | Takes the AX mix off the guest's thread. |
-| `runtime/cmake/PublicProducts.cmake`, `web/build.sh` | `MKW_WEB_RENDER_THREAD` (on by default in `build.sh`): every object compiled with `-pthread`, linked with `-sPTHREAD_POOL_SIZE=3 -sOFFSCREENCANVAS_SUPPORT` and `web/js/render/library_mkw_render.js`, in `<build>/wasm-baton` (the baton build's directory: the same objects, so a compiler cache serves both), without the prebuilt package. `MKW_WEB_RENDER_THREAD=0` builds the single-threaded module. | The render thread. |
+| `runtime/cmake/PublicProducts.cmake`, `web/build.sh` | `MKW_WEB_RENDER_THREAD` (on by default in `build.sh`): every object compiled with `-pthread`, linked with `-sPTHREAD_POOL_SIZE=3 -sDEFAULT_PTHREAD_STACK_SIZE=1MB -sOFFSCREENCANVAS_SUPPORT` and `web/js/render/library_mkw_render.js`, in `<build>/wasm-baton` (the baton build's directory: the same objects, so a compiler cache serves both), without the prebuilt package. `MKW_WEB_RENDER_THREAD=0` builds the single-threaded module. | The render thread. |
 
 ## Added
 
@@ -303,6 +303,8 @@ phases in `aurora.cpp`), runs on it as two jobs posted to its event loop: `web_c
 frame's surface, staging buffers and pass 0). A browser thread that blocks never presents its
 canvas or settles a promise, so the render thread never waits between jobs; it returns to its
 event loop after each. The AX mixer runs on its own worker too (`ax_mix.cpp`, as natively).
+Emscripten gives a pthread 64 KiB of stack and a wasm stack overflow corrupts memory silently,
+so the render thread asks for 4 MiB and every other thread gets 1 MiB.
 
 **What stays.** The guest's thread still runs the game's code and decodes the GX FIFO into
 aurora's command lists (most of a picture's cost on the phone: about three quarters of the

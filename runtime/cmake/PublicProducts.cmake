@@ -264,6 +264,10 @@ function(mkw_configure_web_product target)
             # Workers loaded before main(): the render thread and the AX mix worker start at once
             # instead of waiting for a worker script while the guest's thread waits on them.
             -sPTHREAD_POOL_SIZE=3
+            # Emscripten's default pthread stack is 64 KiB, and an overflow corrupts the heap
+            # silently: the AX mix worker (a std::thread) gets 1 MiB like a native thread would.
+            # The render thread sets its own (web_render_thread.cpp).
+            -sDEFAULT_PTHREAD_STACK_SIZE=1MB
             # The canvas is transferred to the render thread (emscripten_pthread_attr_
             # settransferredcanvases), and SDL's size changes reach it from the main thread.
             -sOFFSCREENCANVAS_SUPPORT
