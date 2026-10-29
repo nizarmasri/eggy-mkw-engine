@@ -104,17 +104,24 @@ a frame), so every run was always behind and ran exactly four calcs a pass:
 6-29 game frames/s, never 60. In that state the race is the same whatever is
 drawn: report hash 2500981042 at frame 1500 with drawEvery 1, 2 and 4, with
 slowDraw=30000, and on the baton build. Results ran 10.5 s; two humans reach
-the report. Race API 1 gave 2205138225 for the same race, which looked like
-catch-up changing the race. It was not: those smokes ran with `skip=0` (drawing
-every pass) and API 1's with the test page's default render skip (one frame in
-20). With engine-c8b5f78 and `hashParts=1`, `pacing=0` and `pacing=1` agree on
-every part at every checkpoint (2205138225, both with the render skip), and
-`skip=0` against the render skip differs in one part only, `rng2` (RaceManager
-+0x8), at some checkpoints and not others: the same sequence, reached sooner by
-the run that draws more. Drawing takes numbers from the race's second generator
-(effects set up when first drawn). Fixed in the draw hook: every draw runs on its
-own copy of both race generators (`DrawRandomsIn`/`DrawRandomsOut`), so the
-race's move with its calcs alone whatever a phone draws.
+the report.
+
+**The hash and what a phone draws (2026-10-29).** Race API 1 gave 2205138225
+for the same race, which looked like catch-up changing the race. It was not:
+those smokes drew every pass (`skip=0`) and API 1's drew one frame in 20 (the
+test page's default render skip). With `hashParts=1`, `pacing=0` and `pacing=1`
+agree on every part at every checkpoint, and drawing every pass against one in
+20 differs in `rng2` (RaceManager +0x8) alone, at some checkpoints and not
+others: the same sequence, reached sooner by the run that draws more. Drawing
+takes numbers from the second generator, not inside `SceneManager::draw`
+itself (giving each draw its own copy of the generators changed nothing), and
+nothing the race plays reads it: scrambled on every race frame for 1500 frames
+(six karts, items on, items picked up), no other part moved, while scrambling
+`rng1` the same way parted the race within 240 frames. So the hash takes `rng1`
+only, and two phones that draw differently hash the same race the same.
+(`field=7` and up on the test page crashed loading karts until its computer
+list stopped putting King Boo, Funky Kong and Bowser Jr. on another weight
+class's vehicle; Eggy's own picks are weight-checked.)
 
 ### How to hook guest code without losing it
 
