@@ -4,6 +4,7 @@
 #include "system_bridge.h"
 #include "game_graphics_options.h"
 #include "runtime_log.h"
+#include "eggy/logic_switch.h"  // [Eggy] logic performance switches
 
 #include <array>
 #include <atomic>
@@ -451,7 +452,7 @@ inline bool TryDispatchRawCpuTarget(const RawDispatchRecord* record, CpuContext*
     // own context. Same call as below without building the two guard objects (about 250 bytes
     // of stack frame) whose constructors and destructors would do nothing.
     if (!record->preserveNonvolatileGprs && record->nonvolatileFprWriteMask == 0 &&
-        TryGetCpuContext() == cpu) [[likely]] {
+        TryGetCpuContext() == cpu && LogicSwitch::On(LogicSwitch::kIndirectFast)) [[likely]] {
         RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
         record->entry(cpu);
         return true;

@@ -13,7 +13,6 @@ extern uint32_t g_off;
 
 enum : uint32_t {
     kIndirectFast = 1u << 0,  // abi_bridge.h TryDispatchRawCpuTarget: skip the guards' setup
-    kLastPage = 1u << 1,      // memory.cpp: a backing store's last 1 MiB page takes the coarse tier
 };
 
 inline bool On(uint32_t bit) noexcept { return (g_off & bit) == 0; }
