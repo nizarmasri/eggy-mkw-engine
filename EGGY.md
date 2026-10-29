@@ -312,8 +312,13 @@ draw hook is the game's own code and aurora's GX decoding). WebGPU calls it make
 decoding (texture, bind group and pipeline cache misses) and during startup run on the render
 thread while it waits: `web/js/render/library_mkw_render.js` decorates every emdawnwebgpu
 import so that, called anywhere but the render thread, it serializes its arguments and
-`mkw_render_run_js` proxies it there (a promise-returning one, `emwgpuWaitAny`, keeps the caller
-waiting until it settles). The guest waits for the render thread in two places only: before
+`mkw_render_run_js` proxies it there. A promise-returning one (`emwgpuWaitAny`: the adapter, the
+device, a synchronous readback) must not block the browser main thread: Chrome sets up a
+worker's WebGPU connection with a task on the main thread, so a main thread blocked on the render
+thread's `requestAdapter` waits forever (engine-5cc24f7's first smoke: "Failed to create WebGPU
+adapter: TimedOut" after 5 s). On the main thread it goes through `mkw_render_run_js_async`
+instead: the guest's wasm suspends under JSPI, as it did when WebGPU was on the main thread, and
+the render thread's answer resumes it from the main thread's event loop. The guest waits for the render thread in two places only: before
 the first GX decode of a frame until the previous frame is sealed and the next prepared
 (`sealWaitMs`), and before sealing a frame while the render thread is still a whole frame
 behind (`doneWaitMs`). At most one frame is in flight. Game state never depends on the render

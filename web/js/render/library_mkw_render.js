@@ -10,7 +10,11 @@
 // misses; aurora's initialization) runs there while the caller waits: its arguments are
 // serialized as Emscripten's own main-thread proxying does, mkw_render_run_js proxies the call,
 // and mkw_render_receive_js runs the original function on the render thread. One that returns a
-// promise (emwgpuWaitAny, a timed wait) keeps the caller waiting until it settles. On the render
+// promise (emwgpuWaitAny, a timed wait) finishes when it settles. Called on the browser main
+// thread, that one never blocks it: Chrome sets up a worker's WebGPU connection with a task on the
+// main thread, so a main thread blocked on the render thread's requestAdapter would wait forever.
+// It returns a promise instead (the import is a JSPI suspending one, so the guest's wasm suspends
+// and the main thread runs its event loop), resolved by mkw_render_async_done_js. On the render
 // thread itself, or before it exists (or in a page that turned it off), the import is the
 // original function plus one comparison.
 //
@@ -52,12 +56,16 @@
         // a promise: nothing there runs under a JSPI promising export, so suspending would trap.
         // There it returns 0 (no future completed: the wait timed out), which only aurora's
         // release_surface can meet (it waits for the queue before dropping the surface).
-        const local = library[key + '__async']
+        const async = !!library[key + '__async'];
+        const local = async
           ? `{ var r = mkwr_${key}(${args}); return MkwRender.onRenderThread() ? MkwRender.noWait(r, '${key}') : r; }`
           : `return mkwr_${key}(${args});`;
+        const remote = async
+          ? `return ENVIRONMENT_IS_PTHREAD ? MkwRender.call(${index}, [${args}]) : MkwRender.callAsync(${index}, [${args}]);`
+          : `return MkwRender.call(${index}, [${args}]);`;
         library[key] = (0, eval)(`(function (${args}) {
           if (MkwRender.local()) ${local}
-          return MkwRender.call(${index}, [${args}]);
+          ${remote}
         })`);
         library[key + '__deps'] = [original, '$MkwRender'];
       }
@@ -78,8 +86,8 @@
 })();
 
 addToLibrary({
-  $MkwRender__deps: ['$stackSave', '$stackRestore', '$stackAlloc', 'mkw_render_run_js', 'mkw_render_thread_id',
-                     'pthread_self'],
+  $MkwRender__deps: ['$stackSave', '$stackRestore', '$stackAlloc', 'malloc', 'free', 'mkw_render_run_js',
+                     'mkw_render_run_js_async', 'mkw_render_thread_id', 'pthread_self'],
   $MkwRender: {
     // The original imports by index, filled in on every thread by their postsets.
     fns: [],
@@ -109,12 +117,9 @@ addToLibrary({
       }
       return 0;
     },
-    // Runs import `index` on the render thread with `args` (numbers or BigInts) and returns its
-    // result, waiting for it.
-    call(index, args) {
-      var sp = stackSave();
-      var buf = stackAlloc(16 * args.length + 24);
-      var result = buf + 16 * args.length;
+    // The arguments as mkw_render_receive_js reads them: 16 bytes each, a BigInt flag then the
+    // value; and the result's flag cleared.
+    put(buf, args) {
       for (var i = 0; i < args.length; i++) {
         var arg = args[i];
         if (typeof arg == 'bigint') {
@@ -125,15 +130,50 @@ addToLibrary({
           {{{ makeSetValue('buf', '16 * i + 8', '+arg', 'double') }}};
         }
       }
+      var result = buf + 16 * args.length;
       {{{ makeSetValue('result', 16, 0, 'i32') }}};
+      return result;
+    },
+    get(result) {
+      return {{{ makeGetValue('result', 16, 'i32') }}} ? {{{ makeGetValue('result', 8, 'i64') }}}
+                                                     : {{{ makeGetValue('result', 0, 'double') }}};
+    },
+    // Runs import `index` on the render thread with `args` (numbers or BigInts) and returns its
+    // result, waiting for it.
+    call(index, args) {
+      var sp = stackSave();
+      var buf = stackAlloc(16 * args.length + 24);
+      var result = MkwRender.put(buf, args);
       if (!_mkw_render_run_js(index, args.length, buf, result)) {
         stackRestore(sp);
         abort(`[render] could not run WebGPU import ${index} on the render thread`);
       }
-      var rtn = {{{ makeGetValue('result', 16, 'i32') }}} ? {{{ makeGetValue('result', 8, 'i64') }}}
-                                                          : {{{ makeGetValue('result', 0, 'double') }}};
+      var rtn = MkwRender.get(result);
       stackRestore(sp);
       return rtn;
+    },
+    // The same without blocking: a promise of the result, settled from this thread's event loop.
+    // The buffer is malloc'd, since the caller's wasm stack is suspended meanwhile.
+    // Plain data only: the library object is written into the module as source text.
+    pending: {},
+    lastToken: 0,
+    callAsync(index, args) {
+      var buf = _malloc(16 * args.length + 24);
+      var result = MkwRender.put(buf, args);
+      return new Promise((resolve) => {
+        var token = ++MkwRender.lastToken;
+        MkwRender.pending[token] = (ok) => {
+          var rtn = ok ? MkwRender.get(result) : 0;
+          _free(buf);
+          if (!ok) abort(`[render] WebGPU import ${index} was cancelled on the render thread`);
+          resolve(rtn);
+        };
+        if (!_mkw_render_run_js_async(index, args.length, buf, result, token)) {
+          delete MkwRender.pending[token];
+          _free(buf);
+          abort(`[render] could not send WebGPU import ${index} to the render thread`);
+        }
+      });
     },
     store(result, rtn) {
       if (typeof rtn == 'bigint') {
@@ -143,6 +183,15 @@ addToLibrary({
         {{{ makeSetValue('result', 0, 'rtn === undefined ? 0 : +rtn', 'double') }}};
       }
     },
+  },
+
+  // On the calling thread, from its event loop: an asynchronous call finished (ok) or was
+  // cancelled (web_render_thread.cpp mkw_render_run_js_async).
+  mkw_render_async_done_js__deps: ['$MkwRender'],
+  mkw_render_async_done_js: (token, ok) => {
+    var settle = MkwRender.pending[token];
+    delete MkwRender.pending[token];
+    if (settle) settle(ok);
   },
 
   // On the render thread: the proxied call (web_render_thread.cpp mkw_render_run_js).

@@ -185,10 +185,18 @@ void note_done_wait(uint64_t micros) noexcept { g_doneWaitMicros.fetch_add(micro
 // bytes each: a BigInt flag, then the value) and calls mkw_render_run_js, which runs
 // mkw_render_receive_js on the render thread while the caller waits. That one calls the original
 // import there and writes its result to `result` (a number at +0, a BigInt at +8, the flag at
-// +16); an import that returns a promise finishes when the promise settles (the caller keeps
-// waiting).
+// +16); an import that returns a promise finishes when the promise settles.
+//
+// The browser main thread must never block on a promise there: Chrome creates a worker's WebGPU
+// connection on the main thread (requestAdapter in a worker waits for a main-thread task), so a
+// main thread spinning in emscripten_proxy_sync while the render thread waits for its adapter
+// waits forever. A suspending import (emwgpuWaitAny) called on the main thread therefore goes
+// through mkw_render_run_js_async: the main thread's wasm suspends under JSPI and returns to its
+// event loop, and mkw_render_async_done_js resumes it from there once the render thread settled
+// the promise.
 extern "C" {
 void mkw_render_receive_js(int index, int nargs, const void* args, void* result, void* call);
+void mkw_render_async_done_js(int token, int ok);
 
 struct MkwRenderJsCall {
   em_proxying_ctx* ctx;
@@ -225,6 +233,52 @@ EMSCRIPTEN_KEEPALIVE int mkw_render_run_js(int index, int nargs, const void* arg
   g_proxiedCalls.fetch_add(1, std::memory_order_relaxed);
   g_proxiedMicros.fetch_add(static_cast<uint64_t>((emscripten_get_now() - started) * 1000.0),
                             std::memory_order_relaxed);
+  return ok;
+}
+
+// The asynchronous call: MkwRenderJsCall first, so mkw_render_js_done finishes it the same way.
+struct MkwRenderAsyncCall {
+  MkwRenderJsCall call;
+  int token;
+  double started;
+};
+
+EMSCRIPTEN_KEEPALIVE int mkw_render_run_js_async(int index, int nargs, const void* args, void* result, int token) {
+  using namespace aurora::webgpu::render_thread;
+  const pthread_t thread = g_thread.load(std::memory_order_acquire);
+  if (thread == 0) {
+    return 0;
+  }
+  auto* async = new MkwRenderAsyncCall{{nullptr, index, nargs, args, result}, token, emscripten_get_now()};
+  const int ok = emscripten_proxy_callback_with_ctx(
+      g_jsQueue, thread,
+      // On the render thread.
+      [](em_proxying_ctx* ctx, void* arg) {
+        auto* c = static_cast<MkwRenderAsyncCall*>(arg);
+        c->call.ctx = ctx;
+        mkw_render_receive_js(c->call.index, c->call.nargs, c->call.args, c->call.result, &c->call);
+      },
+      // Back on the calling thread, from its event loop: done.
+      [](void* arg) {
+        auto* c = static_cast<MkwRenderAsyncCall*>(arg);
+        g_proxiedCalls.fetch_add(1, std::memory_order_relaxed);
+        g_proxiedMicros.fetch_add(static_cast<uint64_t>((emscripten_get_now() - c->started) * 1000.0),
+                                  std::memory_order_relaxed);
+        const int done = c->token;
+        delete c;
+        mkw_render_async_done_js(done, 1);
+      },
+      // The render thread went away first.
+      [](void* arg) {
+        auto* c = static_cast<MkwRenderAsyncCall*>(arg);
+        const int done = c->token;
+        delete c;
+        mkw_render_async_done_js(done, 0);
+      },
+      async);
+  if (!ok) {
+    delete async;
+  }
   return ok;
 }
 
