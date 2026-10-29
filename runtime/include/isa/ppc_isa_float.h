@@ -428,6 +428,44 @@ inline double PpcPackIntegerWordInline(int32_t value)
         static_cast<uint64_t>(static_cast<uint32_t>(value)));
 }
 
+// [Eggy] WebAssembly has no fused multiply-add instruction (relaxed SIMD's does not fix its
+// rounding), so std::fma is a call into musl's software routine on every lane of a ps_madd and in
+// every fmadds. These two answer inline when musl's answer is a plain product and sum, and call it
+// otherwise, so every result keeps its bits.
+inline float PpcFmaSingleInline(float x, float y, float z)
+{
+#if defined(__EMSCRIPTEN__)
+    // musl fmaf's common case as it is written there: two floats' product is exact in a double,
+    // the sum rounds once, and unless that double sits exactly on a float halfway point (or is a
+    // NaN) its conversion to float is the result.
+    const double xy = static_cast<double>(x) * y;
+    const double result = xy + z;
+    const uint64_t bits = PpcBitCastToU64Inline(result);
+    if ((bits & 0x1FFFFFFFu) != 0x10000000u || ((bits >> 52) & 0x7FFu) == 0x7FFu) [[likely]]
+        return static_cast<float>(result);
+#endif
+    return std::fma(x, y, z);
+}
+
+inline double PpcFmaDoubleInline(double a, double c, double b)
+{
+#if defined(__EMSCRIPTEN__)
+    // a with at most 24 significant bits and c with at most 25 (single values, and fmadds's C after
+    // Force25Bit) multiply exactly in a double, so the fused result is the one rounding of the
+    // product plus b. Exponents within 2^+-500 keep the product off the subnormals and infinity;
+    // a non-finite b (which musl returns as it is) takes the call.
+    const uint64_t aBits = PpcBitCastToU64Inline(a);
+    const uint64_t cBits = PpcBitCastToU64Inline(c);
+    const uint32_t aExp = static_cast<uint32_t>(aBits >> 52) & 0x7FFu;
+    const uint32_t cExp = static_cast<uint32_t>(cBits >> 52) & 0x7FFu;
+    const uint32_t bExp = static_cast<uint32_t>(PpcBitCastToU64Inline(b) >> 52) & 0x7FFu;
+    if ((aBits & 0x1FFFFFFFu) == 0 && (cBits & 0x0FFFFFFFu) == 0 &&
+        aExp - 523u <= 1000u && cExp - 523u <= 1000u && bExp != 0x7FFu) [[likely]]
+        return a * c + b;
+#endif
+    return std::fma(a, c, b);
+}
+
 template <bool Subtract>
 inline float PpcAccuratePsMaddLaneInline(float a, float c, float b)
 {
@@ -436,14 +474,14 @@ inline float PpcAccuratePsMaddLaneInline(float a, float c, float b)
     // explicit float FMA therefore matches Gekko's single rounding point;
     // multiplying and adding separately can differ by an ULP on ordinary
     // vector and matrix workloads.
-    return PpcFlushSingleForNiInline(std::fma(a, c, signedB));
+    return PpcFlushSingleForNiInline(PpcFmaSingleInline(a, c, signedB));
 }
 
 template <bool Subtract>
 inline float PpcAccuratePsMaddLaneNoNiInline(float a, float c, float b)
 {
     const float signedB = Subtract ? -b : b;
-    return std::fma(a, c, signedB);
+    return PpcFmaSingleInline(a, c, signedB);
 }
 
 template <bool Subtract>
@@ -456,7 +494,7 @@ inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double
     // Recover the direction of that discarded error for those tie cases.
     const double roundedC = PpcForce25BitInline(c);
     const double signedB = Subtract ? -b : b;
-    double result = std::fma(a, roundedC, signedB);
+    double result = PpcFmaDoubleInline(a, roundedC, signedB);
     const uint64_t resultBits = PpcBitCastToU64Inline(result);
     constexpr uint64_t kDiscardedMask = 0x000000001FFFFFFFULL;
     constexpr uint64_t kEvenTie = 0x0000000010000000ULL;
@@ -464,7 +502,7 @@ inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double
     {
         const double aPrime = signedB - result;
         const double bPrime = result + aPrime;
-        const double deltaA = std::fma(a, roundedC, aPrime);
+        const double deltaA = PpcFmaDoubleInline(a, roundedC, aPrime);
         const double deltaB = signedB - bPrime;
         const double error = deltaA + deltaB;
         if (error != 0.0)
@@ -489,23 +527,23 @@ inline double PpcFmulsNoNiInline(double a, double c)
 
 inline double PpcFmaddInline(double a, double c, double b)
 {
-    return std::fma(a, c, b);
+    return PpcFmaDoubleInline(a, c, b);
 }
 
 inline double PpcFmsubInline(double a, double c, double b)
 {
-    return std::fma(a, c, -b);
+    return PpcFmaDoubleInline(a, c, -b);
 }
 
 inline double PpcFnmaddInline(double a, double c, double b)
 {
-    const double result = std::fma(a, c, b);
+    const double result = PpcFmaDoubleInline(a, c, b);
     return std::isnan(result) ? result : -result;
 }
 
 inline double PpcFnmsubInline(double a, double c, double b)
 {
-    const double result = std::fma(a, c, -b);
+    const double result = PpcFmaDoubleInline(a, c, -b);
     return std::isnan(result) ? result : -result;
 }
 
