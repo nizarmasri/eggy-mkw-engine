@@ -408,9 +408,24 @@ needs a token with the `workflow` scope).
   picture before decoding the next. The AX mix worker loses on two cores for the same reason (the
   main thread spins on the join while the worker waits for a core). A phone has real GPU work and
   idle cores, so these numbers say little about it; the phone is the test.
-- Next, if the phone wants more: the main thread's waits for the render thread (SEALED, DONE) and
-  for the mix should suspend under JSPI instead of spinning (a free core for the other threads,
-  and less heat on a phone); SEALED can be published right after seal and prepare, so the guest
-  decodes the next frame while the render thread encodes (aurora does this natively while it
-  interpolates); the mix worker can be turned off on the web if the phone's `audioMs` does not
-  drop.
+- engine-4cd9e8d (main-thread waits suspend; the switches above), same runner as
+  engine-440bff3 in smoke-ab 40921034748, `skip=0&drawEvery=1`, two rounds each, same hash every
+  run:
+
+  | | 440bff3 | 4cd9e8d |
+  |---|---|---|
+  | race wall, game frames/s | 4.3 | 6.4 |
+  | pictures/s | 1.16-1.21 | 1.72-1.73 |
+  | calcMs | 10.5-11.6 | 11.8-11.9 |
+  | audioMs | 20.9-21.7 | 12.3-12.4 |
+  | render thread per picture | 828-865 | 560-565 |
+  | sealWaitMs | 196-204 | 128-129 |
+
+  A main thread that no longer spins leaves the second core to the render thread and the mixer.
+  Smoke A on it (40921024584): hash 2276745402, results 10.5 s, 54-65 game frames/s once warm.
+  Twice there the render thread stalled 5-6 s on one picture while a Playwright screenshot was
+  pending (the second stall ended when the screenshot timed out); engine-440bff3, whose main
+  thread spun, lost a screenshot without a stall. A phone takes no such screenshots; if a
+  picture ever freezes for seconds there, `?suspendWaits=0` is the comparison.
+- The phone is the test: `?renderThread=0`, `?axWorker=0` and `?suspendWaits=0` each turn one
+  piece off in the same engine.
