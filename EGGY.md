@@ -20,10 +20,16 @@ repository from a pinned commit of this one.
 | `runtime/src/hle/gx/gx_egg.cpp` | The `AsyncDisplay::endRender` HLE returns at once when `Eggy::SkipEndRender()`. | Race frames Eggy does not show (`renderSkip`, `drawEvery`) skip the EFB copy with the draw, so the screen keeps the last shown frame. |
 | `runtime/src/hle/vi.cpp`, `runtime/src/hle/audio/audio.cpp` | `Eggy::Perf::Scope` timers (marked `// [eggy]`) around aurora's frame end/begin, the browser yield, the wait for the retrace boundary, the idle sleeps and the audio mixer. | Race API 2's `perf()` breakdown. They count only in Eggy mode during a race or its results; otherwise one branch. |
 | `web/build.sh` | `MKW_CMAKE_ARGS` is added to the configure, and `MKW_PRECOMPRESS_ARGS` to `precompress_dist.py`; both are unset by default. The site keeps the link's symbol map (`.js.symbols` in `WEB_EXTRA_SUFFIXES`). | Eggy's CI caches compiles that use the precompiled headers through ccache (it passes a project include with `-Xclang -fno-pch-timestamp`), and skips the brotli copy of the wasm, which its pack never reads. A CI profile names wasm functions from the symbol map. |
-| `runtime/include/memory_access.h` | (wasm) A guest store inlines only the coarse-page arm (`TryWriteGuestScalarCoarse`); the sparse tier and the checked path are one cold call (`FlatStoreCold`, `WriteScalarCold`). Byte swaps are rotate-and-mask with an empty `asm` barrier instead of LLVM's shift-and-or expansion of `bswap`. | Race logic, measured on one CI runner: the store change -3% of calc and a 19% smaller wasm, the swaps -4%. Same bytes. |
+| `runtime/include/memory_access.h` | (wasm) A guest store inlines only the coarse-page arm (`TryWriteGuestScalarCoarse`); the sparse tier and the checked path are one cold call (`FlatStoreCold`, `WriteScalarCold`). Byte swaps are rotate-and-mask with an empty `asm` barrier instead of LLVM's shift-and-or expansion of `bswap`. | Race logic (calc), measured on one CI runner: the store change -10% and a 19% smaller wasm, the swaps -4%. Same bytes. |
 | `runtime/include/abi_bridge.h` | (wasm) The indirect-call memo has 4096 slots, not 512. `TryDispatchRawCpuTarget` calls a translated target that needs no register guard directly, without building the guards (logic switch 1 turns it off). | Virtual calls: memo collisions paid a binary search over the registry; the guards cost the most per call. |
 | `runtime/include/isa/ppc_isa_float.h` | (wasm) The single-precision flush is scalar f64 ops; the 25-bit round of C is one operation fewer (all hosts); fused multiply-adds answer inline when musl's answer is a plain product and sum (`PpcFmaSingleInline`, `PpcFmaDoubleInline`) and call it otherwise. | The flush went through Emscripten's SSE emulation on every single-precision op, and every `ps_madd` lane and `fmadds` was a call into musl's software fma. Same bits for every input. |
 | `runtime/include/isa/ppc_isa_quantized.h` | (wasm) A paired float load or store looks up one page bias (the one `Memory::Read64` makes), not both ends of the range. | Fewer lookups on every `psq_l`/`psq_st`; same bytes. |
+
+The four rows above together (engine-0cfd3c7, 2026-10-29): race calc about 20% lower at steady
+state on a CI runner (field=8; the same race hash with 1 and 2 humans), the wasm 128 to 100 MB
+(gzip 28 to 23 MB), and V8 reaches full speed sooner after load. Not taken: the translator's
+range threshold at 3 instead of 8 (another 3% and 3 MB) changed a two-human race at frame
+839-899 (the first computer kart's state), so it waits for the cause.
 
 ## Added
 
