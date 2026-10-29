@@ -303,7 +303,15 @@ struct KnownTypedNativeCpuCall {
 // a miss just re-runs the sorted lookup. 512 entries (12 KiB) covers the per-frame indirect
 // working set while staying L1/L2 resident, unlike 4096 which would thrash L2. Must stay a
 // power of two, the index masks with (size - 1).
+#if defined(__EMSCRIPTEN__)
+// [Eggy] WebAssembly: 4096. The slot is a function of the target's address bits 2..(2+n), so with
+// a race frame's few hundred virtual-call targets 512 slots left about one target in three sharing
+// a slot, and every collision that alternates pays a binary search over the whole registry
+// (FindRawByAddressPtrMiss was ~1% of the race's game logic). Only touched entries cost cache.
+inline constexpr size_t kIndirectDispatchCacheEntries = 4096;
+#else
 inline constexpr size_t kIndirectDispatchCacheEntries = 512;
+#endif
 
 // Namespace-scope `inline thread_local`, not function-local `static thread_local`, to avoid a
 // thread-static init epoch check on every bctrl (same as g_currentCpuContext in ppc_runtime.h).
