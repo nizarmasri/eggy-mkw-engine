@@ -423,6 +423,31 @@ MKW_MEMORY_FORCE_INLINE bool TryWriteGuestScalar(uint32_t address, T value) {
     return true;
 }
 
+// The hot arm of TryWriteGuestScalar alone: an access inside one 1 MiB page with a coarse
+// writable bias. Whenever this says no, TryWriteGuestScalar's full answer (sparse 4 KiB tier
+// included) is taken out of line by the *Cold helpers below, so a store site in translated code
+// carries a dozen instructions instead of the whole sparse and executable-guard logic. A store
+// it accepts is exactly the one TryWriteGuestScalar would make: an address that wraps past
+// 0xFFFFFFFF ends on another page, so the separate wrap test is not needed here.
+template <typename T>
+MKW_MEMORY_FORCE_INLINE bool TryWriteGuestScalarCoarse(uint32_t address, T value) {
+    static_assert(sizeof(T) >= 1 && sizeof(T) <= kMaxFastScalarSize);
+    const uint32_t coarsePage = address >> kPageShift;
+    if (((address + static_cast<uint32_t>(sizeof(T) - 1u)) >> kPageShift) != coarsePage) [[unlikely]]
+        return false;
+    const uintptr_t encodedBias = g_fullWritablePageBias[coarsePage];
+    if (encodedBias == 0) [[unlikely]]
+        return false;
+    auto* ptr = reinterpret_cast<uint8_t*>((encodedBias - 1u) + address);
+    if constexpr (sizeof(T) == 1) {
+        *ptr = static_cast<uint8_t>(value);
+    } else {
+        const T swapped = MaybeByteSwap(value);
+        std::memcpy(ptr, &swapped, sizeof(T));
+    }
+    return true;
+}
+
 template <typename T>
 inline bool WriteStackScalarFast(uint32_t address, T value) {
     uint8_t* ptr = nullptr;
@@ -576,12 +601,18 @@ MKW_MEMORY_FORCE_INLINE T FlatLoad(uint32_t address) {
 }
 
 template <typename T>
-MKW_MEMORY_FORCE_INLINE void FlatStore(uint32_t address, T value) {
-    if (TryWriteGuestScalar(address, value)) [[likely]] return;
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD void FlatStoreCold(uint32_t address, T value) {
+    if (TryWriteGuestScalar(address, value)) return;
     if constexpr (sizeof(T) == 1) Write8Slow(address, static_cast<uint8_t>(value));
     else if constexpr (sizeof(T) == 2) Write16Slow(address, static_cast<uint16_t>(value));
     else if constexpr (sizeof(T) == 4) Write32Slow(address, static_cast<uint32_t>(value));
     else Write64Slow(address, static_cast<uint64_t>(value));
+}
+
+template <typename T>
+MKW_MEMORY_FORCE_INLINE void FlatStore(uint32_t address, T value) {
+    if (TryWriteGuestScalarCoarse(address, value)) [[likely]] return;
+    FlatStoreCold(address, value);
 }
 #else
 template <typename T>
@@ -688,6 +719,30 @@ MKW_MEMORY_FORCE_INLINE void FlatWriteRamFloat64(uint32_t address, double value)
     FlatStore<uint64_t>(address, bits);
 }
 
+// The complete store of Memory::Write* (sparse tier, then the checked slow path), for the
+// accesses TryWriteGuestScalarCoarse turned down.
+template <typename T>
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD void WriteScalarCold(uint32_t address, T value) {
+    if (TryWriteGuestScalar(address, value)) return;
+    if constexpr (sizeof(T) == 1) Write8Slow(address, static_cast<uint8_t>(value));
+    else if constexpr (sizeof(T) == 2) Write16Slow(address, static_cast<uint16_t>(value));
+    else if constexpr (sizeof(T) == 4) Write32Slow(address, static_cast<uint32_t>(value));
+    else Write64Slow(address, static_cast<uint64_t>(value));
+}
+
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD inline void WriteFloat32Cold(uint32_t address, double value) {
+    const uint32_t bits = ConvertPpcDoubleToSingleBits(value);
+    if (TryWriteGuestScalar(address, bits)) return;
+    WriteFloat32Slow(address, value);
+}
+
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD inline void WriteFloat64Cold(uint32_t address, double value) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if (TryWriteGuestScalar(address, bits)) return;
+    WriteFloat64Slow(address, value);
+}
+
 } // namespace MemoryInline
 
 #undef MKW_MEMORY_FORCE_INLINE
@@ -741,40 +796,40 @@ inline double Memory::ReadFloat64(uint32_t addr) {
 }
 
 inline void Memory::Write8(uint32_t addr, uint8_t val) {
-    if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
-        MemoryInline::Write8Slow(addr, val);
+    if (!MemoryInline::TryWriteGuestScalarCoarse(addr, val)) [[unlikely]]
+        MemoryInline::WriteScalarCold(addr, val);
 }
 
 inline void Memory::Write16(uint32_t addr, uint16_t val) {
-    if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
-        MemoryInline::Write16Slow(addr, val);
+    if (!MemoryInline::TryWriteGuestScalarCoarse(addr, val)) [[unlikely]]
+        MemoryInline::WriteScalarCold(addr, val);
 }
 
 inline void Memory::Write32(uint32_t addr, uint32_t val) {
-    if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
-        MemoryInline::Write32Slow(addr, val);
+    if (!MemoryInline::TryWriteGuestScalarCoarse(addr, val)) [[unlikely]]
+        MemoryInline::WriteScalarCold(addr, val);
 }
 
 inline void Memory::Write64(uint32_t addr, uint64_t val) {
-    if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
-        MemoryInline::Write64Slow(addr, val);
+    if (!MemoryInline::TryWriteGuestScalarCoarse(addr, val)) [[unlikely]]
+        MemoryInline::WriteScalarCold(addr, val);
 }
 
 inline void Memory::WriteFloat32(uint32_t addr, double val) {
     {
         const uint32_t bits = MemoryInline::ConvertPpcDoubleToSingleBits(val);
-        if (MemoryInline::TryWriteGuestScalar(addr, bits))
+        if (MemoryInline::TryWriteGuestScalarCoarse(addr, bits))
             return;
     }
-    [[unlikely]] MemoryInline::WriteFloat32Slow(addr, val);
+    [[unlikely]] MemoryInline::WriteFloat32Cold(addr, val);
 }
 
 inline void Memory::WriteFloat64(uint32_t addr, double val) {
     {
         uint64_t bits = 0;
         std::memcpy(&bits, &val, sizeof(bits));
-        if (MemoryInline::TryWriteGuestScalar(addr, bits))
+        if (MemoryInline::TryWriteGuestScalarCoarse(addr, bits))
             return;
     }
-    [[unlikely]] MemoryInline::WriteFloat64Slow(addr, val);
+    [[unlikely]] MemoryInline::WriteFloat64Cold(addr, val);
 }
